@@ -54,6 +54,7 @@ def plan_cache_budget(
     prefill_overlap: bool,
     kv_reserve_pages: int,
     max_slots: int,
+    kv_cap_pages: int | None = None,
 ) -> tuple[int, int, bool]:
     """Split ``budget_bytes`` MoE-first into (moe_cache_size, num_pages, prefill_overlap).
 
@@ -81,7 +82,10 @@ def plan_cache_budget(
     overlap = overlap and moe_cache_size >= 2 * num_experts
 
     remaining = budget_bytes - moe_cache_size * per_expert_bytes
-    num_pages = max(remaining // cache_per_page, kv_reserve_pages)
+    num_pages = remaining // cache_per_page
+    if kv_cap_pages is not None:
+        num_pages = min(num_pages, kv_cap_pages)
+    num_pages = max(num_pages, kv_reserve_pages)
     # A tiny budget can floor num_pages at kv_reserve_pages even when ``remaining`` is below
     # the reserve (or negative), yielding a plan that exceeds budget_bytes. Reject here so
     # --moe-cache-auto fails in arithmetic instead of OOMing in a later CUDA allocation.
@@ -109,6 +113,7 @@ def resolve_moe_cache_auto(
     kv_reserve_tokens: int,
     page_size: int,
     max_slots: int | None = None,
+    kv_cap_pages: int | None = None,
 ) -> tuple[int, int, bool]:
     """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
@@ -130,4 +135,82 @@ def resolve_moe_cache_auto(
         prefill_overlap=prefill_overlap,
         kv_reserve_pages=kv_reserve_pages,
         max_slots=max_slots,
+        kv_cap_pages=kv_cap_pages,
     )
+
+
+# Unified memory only: the most host memory the disk tier leaves unspent.
+MPS_MIN_FREE_BYTES = 3 * 1024**3 // 2
+
+
+def mps_net_cache_budget_bytes(
+    memory_ratio: float, baseline_free: int, weights_bytes: int, fixed_cache_size: int,
+    min_free_bytes: int = MPS_MIN_FREE_BYTES,
+) -> int:
+    """:func:`net_cache_budget_bytes` with the headroom capped at ``min_free_bytes``."""
+    # baseline_free - int(ratio * baseline_free) rather than int((1-ratio) * baseline_free):
+    # the two differ by a byte, and this one is exactly the reserve net_cache_budget_bytes
+    # keeps, so the small-box case is equal to it rather than one byte off.
+    headroom = min(baseline_free - int(memory_ratio * baseline_free), min_free_bytes)
+    return baseline_free - headroom - weights_bytes - fixed_cache_size
+
+
+# Unified memory only: KV tokens the plan may take, past which the bytes are better left as
+# host memory. 65536 is what one decode request plus a long prompt addresses.
+DEFAULT_MPS_KV_CAP_TOKENS = 65536
+
+
+def resolve_kv_cap_pages(
+    *, max_running_req: int, max_seq_len: int, kv_cap_tokens: int | None, page_size: int,
+) -> int:
+    """KV pages worth capping the plan at, in pages of ``page_size`` tokens: the smaller of
+    what the request limits address (``max_running_req x max_seq_len``) and
+    ``kv_cap_tokens`` (None -> the default above, 0 or less -> off)."""
+    tokens = max_running_req * max_seq_len
+    cap = DEFAULT_MPS_KV_CAP_TOKENS if kv_cap_tokens is None else kv_cap_tokens
+    if cap > 0:
+        tokens = min(tokens, cap)
+    return max(div_ceil(tokens, page_size), 1)
+
+
+def resolve_kv_floor_pages(
+    *, max_running_req: int, max_seq_len: int, max_seq_len_override: int | None,
+    kv_reserve_tokens: int, page_size: int, kv_cap_pages: int,
+) -> int:
+    """KV pages the plan must keep before experts take the rest (unified memory only)."""
+    reserve = div_ceil(kv_reserve_tokens, page_size)
+    if max_seq_len_override is None:
+        return reserve
+    addressable = div_ceil(max_running_req * max_seq_len, page_size)
+    return max(reserve, min(addressable, kv_cap_pages))
+
+
+# Unified memory only: torch's MPS allocator suballocates from MTLHeaps created in four size
+# classes (aten/src/ATen/mps/MPSAllocator.h), so the driver charges more than the byte count.
+MPS_MAX_SMALL_ALLOC = 1 << 20
+MPS_MIN_LARGE_ALLOC = 10 << 20
+MPS_SMALL_HEAP = 8 << 20
+MPS_LARGE_HEAP = 32 << 20
+MPS_XLARGE_HEAP = 1 << 30
+MPS_ROUND_LARGE = 2 << 20
+
+
+def mps_driver_bytes(sizes: "list[int]") -> int:
+    """Driver bytes a sequence of MPS allocations costs, heaps and all."""
+    heaps: list[list[int]] = []  # [total, free] per heap, in creation order
+    for n in sizes:
+        for heap in heaps:
+            if heap[1] >= n:
+                heap[1] -= n
+                break
+        else:
+            if n <= MPS_MAX_SMALL_ALLOC:
+                total = MPS_SMALL_HEAP
+            elif n < MPS_MIN_LARGE_ALLOC:
+                total = MPS_LARGE_HEAP
+            elif n < MPS_XLARGE_HEAP // 2:
+                total = MPS_XLARGE_HEAP
+            else:
+                total = div_ceil(n, MPS_ROUND_LARGE) * MPS_ROUND_LARGE
+            heaps.append([total, total - n])
+    return sum(heap[0] for heap in heaps)
