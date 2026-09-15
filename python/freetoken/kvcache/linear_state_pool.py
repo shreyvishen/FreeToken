@@ -277,6 +277,28 @@ def state_pool_bytes(config, num_slots: int | None = None) -> int:
     return per_req * slots
 
 
+def state_pool_alloc_sizes(config, num_slots: int | None = None) -> list[int]:
+    """The pool's individual device allocations, in construction order."""
+    linear_group = config.model_config.linear_attention_group()
+    slot_states = getattr(config.model_config, "slot_states", ())
+    if linear_group is None:
+        if slot_states:
+            raise ValueError("slot_states ride the linear-state slots; model has no linear group")
+        return []
+    slots = num_slots if num_slots is not None else _linear_pool_num_slots(config)
+    n_layers, local_conv_dim, local_v_heads = _linear_local_dims(linear_group, config.tp_info.size)
+    dtype = config.dtype
+    sizes = [
+        n_layers * slots * local_conv_dim * (linear_group.conv_kernel_dim - 1) * dtype.itemsize,
+        n_layers * slots * local_v_heads * linear_group.key_head_dim
+        * linear_group.value_head_dim * ssm_state_dtype().itemsize,
+    ]
+    for spec in slot_states:
+        item = (spec.dtype if spec.dtype is not None else dtype).itemsize
+        sizes.append(max(1, len(spec.layer_ids)) * slots * math.prod(spec.shape) * item)
+    return sizes
+
+
 def _linear_pool_num_slots(config) -> int:
     """LinearStatePool slot count. Hybrid-radix non-evictable peak is 4 slots per running request
     (1 live + 2 ping-pong + 1 committed snapshot locked through decode), plus a cross-request

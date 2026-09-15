@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import fcntl
 import glob
 import json
 import os
 import re
 import struct
+import sys
 from dataclasses import dataclass
 from typing import Iterable, Iterator
 
@@ -54,6 +56,10 @@ def iter_weight_files(model_path: str) -> list[str]:
     return [f for f in files if not f.endswith("consolidated.safetensors")] or files
 
 
+# macOS has no posix_fadvise.
+_F_NOCACHE = 48
+
+
 def safetensors_weight_map(folder: str) -> dict[str, str]:
     """Tensor name -> shard basename, from the index or from each shard's header when the checkpoint ships none."""
     index = os.path.join(folder, "model.safetensors.index.json")
@@ -76,7 +82,10 @@ def drop_page_cache(path: str) -> None:
     try:
         fd = os.open(path, os.O_RDONLY)
         try:
-            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            if hasattr(os, "posix_fadvise"):
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            elif sys.platform == "darwin":
+                fcntl.fcntl(fd, _F_NOCACHE, 1)
         finally:
             os.close(fd)
     except OSError:

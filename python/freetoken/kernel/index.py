@@ -45,6 +45,11 @@ def indexing(
     output: torch.Tensor | None = None,
     vocab_range: Tuple[int, int] | None = None,  # (start, length)
 ) -> torch.Tensor:
+    if weights.device.type == "mps":
+        # Apple GPU: no JIT nvcc path.
+        from .metal.ops import indexing as indexing_mps
+
+        return indexing_mps(weights, indices, output=output, vocab_range=vocab_range)
     if output is None:
         output = weights.new_empty(indices.shape[0], weights.shape[1])
 

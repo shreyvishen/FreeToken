@@ -59,12 +59,17 @@ class RotaryEmbedding(StateLessOP):
         self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
         assert self.head_size in [64, 128, 256, 512]
 
-        from freetoken.kernel.backend import is_flashinfer_installed
+        from freetoken.kernel.backend import is_cuda, is_flashinfer_installed
 
         if is_flashinfer_installed():
             from flashinfer import apply_rope_with_cos_sin_cache_inplace
-        else:
+        elif is_cuda():
             from freetoken.kernel.triton.rope import apply_rope_with_cos_sin_cache_inplace
+        else:
+            # One Metal launch on MPS; the pure-torch chain in the same function
+            # (~14 launches) is the fallback everywhere else, MPS included when the
+            # shapes fall outside the kernel's contract. Import-safe off MPS.
+            from freetoken.kernel.metal.ops import apply_rope_with_cos_sin_cache_inplace
 
         self.apply_rope_with_cos_sin_cache_inplace = apply_rope_with_cos_sin_cache_inplace
 

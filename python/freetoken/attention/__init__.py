@@ -93,6 +93,21 @@ def create_triton_backend(config: ModelConfig):
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
+    "metal",
+    BackendInfo(
+        supported_types=frozenset({AttnType.FULL}),
+        # Full causal GQA only: the MPS SDPA call behind it takes no window and
+        # no sinks, so a spec-needing model must be refused at config time.
+        consumes_attn_spec=False,
+    ),
+)
+def create_metal_backend(config: ModelConfig):
+    from .metal import MetalAttentionBackend
+
+    return MetalAttentionBackend(config)
+
+
+@SUPPORTED_ATTENTION_BACKENDS.register(
     "dsv4_sparse",
     BackendInfo(supported_types=frozenset({AttnType.DSV4})),
 )

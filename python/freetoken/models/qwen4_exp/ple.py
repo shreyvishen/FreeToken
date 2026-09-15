@@ -569,7 +569,7 @@ class PLELayer(BaseOP):
         self.norm_query = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)
         self.norm_conv = GroupedPlusOneRMSNorm(width, config.rms_norm_eps, self.hc_count)
         self.conv1d = _DepthwiseConv1d(width, args.ple_conv_kernel_size)
-        from freetoken.kernel.fla.chunk import CHUNK_SIZE
+        from freetoken.kernel.fla.const import CHUNK_SIZE
 
         # the track snapshot gathers the last state_len conv inputs before a xCHUNK boundary; a longer history would reach before the forward's first token
         assert self.state_len <= CHUNK_SIZE, (

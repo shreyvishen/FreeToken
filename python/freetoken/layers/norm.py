@@ -8,10 +8,12 @@ from .base import BaseOP
 
 class RMSNorm(BaseOP):
     def __init__(self, size: int, eps: float) -> None:
-        from freetoken.kernel.backend import is_flashinfer_installed
+        from freetoken.kernel.backend import is_flashinfer_installed, is_mps
 
         if is_flashinfer_installed():
             from flashinfer import rmsnorm
+        elif is_mps():
+            from freetoken.kernel.metal.ops import rmsnorm
         else:
             from freetoken.kernel.triton.norm import rmsnorm
 
@@ -34,10 +36,12 @@ class GemmaRMSNorm(BaseOP):
     """
 
     def __init__(self, size: int, eps: float, with_scale: bool = True) -> None:
-        from freetoken.kernel.backend import is_sgl_kernel_installed
+        from freetoken.kernel.backend import is_mps, is_sgl_kernel_installed
 
         if is_sgl_kernel_installed():
             from sgl_kernel import fused_add_rmsnorm, rmsnorm
+        elif is_mps():
+            from freetoken.kernel.metal.ops import fused_add_rmsnorm, rmsnorm
         else:
             from freetoken.kernel.triton.norm import fused_add_rmsnorm, rmsnorm
 
@@ -150,10 +154,12 @@ class GemmaPlusOneRMSNormFused(BaseOP):
 
 class RMSNormFused(BaseOP):
     def __init__(self, size: int, eps: float) -> None:
-        from freetoken.kernel.backend import is_flashinfer_installed
+        from freetoken.kernel.backend import is_flashinfer_installed, is_mps
 
         if is_flashinfer_installed():
             from flashinfer import fused_add_rmsnorm, rmsnorm
+        elif is_mps():
+            from freetoken.kernel.metal.ops import fused_add_rmsnorm, rmsnorm
         else:
             from freetoken.kernel.triton.norm import fused_add_rmsnorm, rmsnorm
 
@@ -185,7 +191,10 @@ class GatedRMSNorm(BaseOP):
         self.activation = activation
 
     def forward(self, x: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel.fla import rms_norm_gated
+        if x.device.type == "mps":
+            from freetoken.kernel.metal.ops import rms_norm_gated
+        else:
+            from freetoken.kernel.fla import rms_norm_gated
 
         return rms_norm_gated(
             x=x, weight=self.weight, bias=None, z=z, eps=self.eps,

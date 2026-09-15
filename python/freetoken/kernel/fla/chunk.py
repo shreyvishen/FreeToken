@@ -25,7 +25,7 @@ from freetoken.kernel.fla.utils import (
 # kernels from sglang.srt.hardware_backend. Stripped on vendoring — FreeToken
 # targets NVIDIA only and we don't carry the sglang hardware_backend package.
 
-CHUNK_SIZE = 64
+from freetoken.kernel.fla.const import CHUNK_SIZE  # noqa: F401  re-exported
 
 
 def chunk_gated_delta_rule_fwd(

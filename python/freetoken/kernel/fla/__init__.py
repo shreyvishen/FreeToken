@@ -36,16 +36,26 @@ recurrence), ``fused_recurrent.py`` (pool-indexed decode kernel with in-kernel K
   gate + beta-sigmoid + q/k l2norm computed in-kernel. The per-token state store reads
   ``ssm_state_indices`` as a CONTIGUOUS [N, T] block; materialize, never ``expand()``.
 """
-from freetoken.kernel.fla.chunk import chunk_gated_delta_rule
-from freetoken.kernel.fla.fused_sigmoid_gating_recurrent import (
-    fused_sigmoid_gating_delta_rule_update,
-)
-from freetoken.kernel.fla.kda import (
-    chunk_kda_with_fused_gate,
-    fused_kda_gate,
-    fused_recurrent_kda,
-)
-from freetoken.kernel.fla.layernorm_gated import rms_norm_gated
+import importlib
+
+# Every entry point below is a triton kernel, and triton is Linux-only (pyproject).
+_LAZY = {
+    "chunk_gated_delta_rule": "freetoken.kernel.fla.chunk",
+    "fused_sigmoid_gating_delta_rule_update": "freetoken.kernel.fla.fused_sigmoid_gating_recurrent",
+    "chunk_kda_with_fused_gate": "freetoken.kernel.fla.kda",
+    "fused_kda_gate": "freetoken.kernel.fla.kda",
+    "fused_recurrent_kda": "freetoken.kernel.fla.kda",
+    "rms_norm_gated": "freetoken.kernel.fla.layernorm_gated",
+}
+
+
+def __getattr__(name: str):
+    if name not in _LAZY:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(importlib.import_module(_LAZY[name]), name)
+    globals()[name] = value
+    return value
+
 
 __all__ = [
     "chunk_gated_delta_rule",

@@ -5,33 +5,26 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from freetoken.kernel import backend as device_backend
+
 if TYPE_CHECKING:
     from freetoken.core import Batch
 
 
 @dataclass
 class FLAMetadata:
-    """Per-forward GatedDeltaNet (flash-linear-attention) metadata, built once per
-    forward and shared by every GDN layer -- mirrors ``BaseAttnMetadata``. Replaces the
-    per-layer rebuilds the GDN op used to do (``cu_seqlens`` arange, per-request
-    ``cache_indices``/``has_initial_state``), which were pageable, synchronous H2D copies
-    issued in each of the 30 GDN layers.
+    """Per-forward GatedDeltaNet metadata, built once per forward and shared by every
+    GDN layer, replacing the per-layer synchronous H2D rebuilds the op used to do."""
 
-    Fields:
-      cu_seqlens          query indptr; decode = arange(bs+1) (1 token/req), prefill =
-                          cumsum of extend_len. int32 on device.
-      cache_indices       per-request recurrent/conv state slot (= Req.table_idx). int32.
-      has_initial_state   prefill only: whether each request continues a cached prefix
-                          (cached_len > 0). None for decode (state always present).
-      fresh_state_indices prefill only: the state-pool slots whose sequence is fresh
-                          (cached_len == 0) and must be zeroed before the chunk kernel
-                          reads them in place. None if there are none / for decode.
-    """
+    cu_seqlens: torch.Tensor          # query indptr, int32 on device
+    cache_indices: torch.Tensor       # per-request recurrent/conv state slot, int32
+    has_initial_state: torch.Tensor | None = None  # prefill only: continues a cached prefix
+    fresh_state_indices: torch.Tensor | None = None  # prefill only: slots to zero first
 
-    cu_seqlens: torch.Tensor
-    cache_indices: torch.Tensor
-    has_initial_state: torch.Tensor | None = None
-    fresh_state_indices: torch.Tensor | None = None
+    # Host copies (prefill only): the Metal conv/GDN kernels iterate requests on the CPU.
+    cu_seqlens_host: list[int] | None = None
+    cache_indices_host: list[int] | None = None
+    has_initial_state_host: list[bool] | None = None
 
     # --- hybrid-radix track-checkpoint (extra_buffer) fields; all None when not caching ---
     # For each request crossing a chunk-aligned (×CHUNK) boundary this forward, snapshot its
@@ -81,11 +74,18 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     track = _build_track_metadata(reqs, cu_host, device, pin)
 
     return FLAMetadata(
-        cu_seqlens=cu_host.to(device, non_blocking=True),
-        cache_indices=idx_host.to(device, non_blocking=True),
-        has_initial_state=has_init_host.to(device, non_blocking=True),
+        cu_seqlens_host=cu_host.tolist(),
+        cache_indices_host=idx_host.tolist(),
+        has_initial_state_host=has_init_host.tolist(),
+        cu_seqlens=cu_host.to(device, non_blocking=device_backend.stage_h2d(cu_host)),
+        cache_indices=idx_host.to(device, non_blocking=device_backend.stage_h2d(idx_host)),
+        has_initial_state=has_init_host.to(
+            device, non_blocking=device_backend.stage_h2d(has_init_host)
+        ),
         fresh_state_indices=(
-            fresh_host.to(device, non_blocking=True) if fresh_host is not None else None
+            fresh_host.to(device, non_blocking=device_backend.stage_h2d(fresh_host))
+            if fresh_host is not None
+            else None
         ),
         **track,
     )
@@ -100,7 +100,7 @@ def _build_track_metadata(reqs, cu_host, device, pin):
     if not any(r.mamba_ping_pong is not None for r in reqs):
         return empty
     from freetoken.core import get_global_ctx
-    from freetoken.kernel.fla.chunk import CHUNK_SIZE
+    from freetoken.kernel.fla.const import CHUNK_SIZE
     from freetoken.kernel.fla.index import prepare_chunk_offsets
 
     km1 = get_global_ctx().linear_state_pool.conv_states.shape[-1]  # conv_kernel_dim - 1
@@ -128,7 +128,9 @@ def _build_track_metadata(reqs, cu_host, device, pin):
         r.mamba_next_track_idx = 1 - r.mamba_next_track_idx
     if not dst:
         return empty
-    to = lambda xs, **kw: torch.tensor(xs, **pin, **kw).to(device, non_blocking=True)
+    def to(xs, **kw):
+        host = torch.tensor(xs, **pin, **kw)
+        return host.to(device, non_blocking=device_backend.stage_h2d(host))
     return dict(
         track_dst=to(dst, dtype=torch.int64),
         track_h_row=to(h_row, dtype=torch.int64),

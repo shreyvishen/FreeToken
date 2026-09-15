@@ -14,7 +14,17 @@ from .hf import (
     load_toolcall_anchor_id,
 )
 from .logger import init_logger
-from .misc import UNSET, Unset, align_ceil, align_down, call_if_main, div_ceil, div_even, mem_GB
+from .misc import (
+    UNSET,
+    Unset,
+    align_ceil,
+    align_down,
+    call_if_main,
+    div_ceil,
+    div_even,
+    mem_GB,
+    set_nocache_fd,
+)
 from .mp import (
     ZmqAsyncPullQueue,
     ZmqAsyncPushQueue,
@@ -45,6 +55,7 @@ __all__ = [
     "align_ceil",
     "align_down",
     "mem_GB",
+    "set_nocache_fd",
     "UNSET",
     "Unset",
     "torch_dtype",

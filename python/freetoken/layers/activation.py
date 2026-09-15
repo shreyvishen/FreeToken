@@ -7,14 +7,34 @@ if TYPE_CHECKING:
 
 
 def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
-    from freetoken.kernel.backend import is_flashinfer_installed
+    from freetoken.kernel.backend import is_flashinfer_installed, is_mps
 
     if is_flashinfer_installed():
         from flashinfer import silu_and_mul
+    elif is_mps():
+        from freetoken.kernel.metal.ops import silu_and_mul
     else:
         from freetoken.kernel.triton.activation import silu_and_mul
 
     return silu_and_mul(x, out=out)
+
+
+def sigmoid_gate_mul(
+    x: torch.Tensor, gate: torch.Tensor, add: torch.Tensor | None = None
+) -> torch.Tensor:
+    """``x * sigmoid(gate) + add``."""
+    from freetoken.kernel.backend import is_mps
+
+    if is_mps():
+        from freetoken.kernel.metal.elementwise import (
+            sigmoid_gate_mul_metal,
+            supports_sigmoid_gate_mul,
+        )
+
+        if supports_sigmoid_gate_mul(x, gate, add):
+            return sigmoid_gate_mul_metal(x, gate, add)
+    y = x * torch.sigmoid(gate)
+    return y if add is None else y + add
 
 
 def gelu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
