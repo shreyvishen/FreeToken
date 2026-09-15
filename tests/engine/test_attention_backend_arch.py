@@ -64,6 +64,7 @@ def _engine_config(**overrides):
 def _patch_env(monkeypatch, *, major, flashinfer=True, sgl=True):
     from freetoken.engine import engine
 
+    monkeypatch.setattr(engine, "is_mps", lambda: False)
     monkeypatch.setattr(engine, "is_sm100_family", lambda: major == 10)
     monkeypatch.setattr(engine, "is_sm90_family", lambda: major == 9)
     monkeypatch.setattr(engine, "_flashinfer_available", lambda: flashinfer)

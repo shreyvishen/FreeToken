@@ -1,6 +1,4 @@
 from __future__ import annotations
-
-import os
 from dataclasses import dataclass
 from typing import Any, ClassVar, Dict, List, Literal, Tuple, TypeAlias
 
@@ -8,25 +6,6 @@ from freetoken.attention.base import AttnType
 
 # State-dict key prefixes of the vision stack; load_weight drops them when the engine serves text-only.
 VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "vision_embedder.", "visual.")
-
-
-# --dense-quant-override / FREETOKEN_DENSE_QUANT_OVERRIDE: "none" (default) or "fp8".
-_DENSE_QUANT_OVERRIDES = ("none", "fp8")
-
-
-def set_dense_quant_override(value: str) -> None:
-    """Record the operator's dense-quant override for this process and its children:
-    the environment is the carrier so parse_config sees it wherever the loader reruns."""
-    value = (value or "none").strip().lower()
-    assert value in _DENSE_QUANT_OVERRIDES, value
-    os.environ["FREETOKEN_DENSE_QUANT_OVERRIDE"] = value
-
-
-def dense_quant_override() -> str:
-    """Operator override for a checkpoint's unquantized dense weights: "fp8" quantizes them
-    to fp8-e4m3 (Metal W8A16), halving their bytes; "none" (default) changes nothing."""
-    value = os.getenv("FREETOKEN_DENSE_QUANT_OVERRIDE", "none").strip().lower()
-    return value if value in _DENSE_QUANT_OVERRIDES else "none"
 
 
 def detect_expert_quant(hf_config: Any) -> str:
@@ -305,9 +284,6 @@ class ModelConfig:
     dense_quant: str = "none"
     # the checkpoint's quant kind for the lm_head, detected the same way (only some NVFP4 exports quantize it)
     lm_head_quant: str = "none"
-    # Which format above --dense-quant-override actually changed, vs the checkpoint's
-    # own; the loader needs the distinction to know whether it must quantize on load.
-    dense_quant_override: str = "none"
     dense_fp8_modules: tuple[str, ...] = ()  # prefixes --dense-quant-override fp8 covers
     shared_expert_intermediate_size: int = 0
     use_qk_norm: bool = False

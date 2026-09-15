@@ -7,7 +7,10 @@ import torch
 
 import os
 
-from freetoken.engine.cache_budget import expert_bytes_per_slot, plan_cache_budget, resolve_moe_cache_auto
+from freetoken.engine.cache_budget import (
+    DEFAULT_MPS_KV_CAP_TOKENS, MPS_MIN_FREE_BYTES, expert_bytes_per_slot, mps_driver_bytes,
+    mps_net_cache_budget_bytes, net_cache_budget_bytes, plan_cache_budget, required_bytes,
+    resolve_kv_cap_pages, resolve_kv_floor_pages, resolve_moe_cache_auto)
 from freetoken.engine.engine import _pin_budget_bytes
 
 
@@ -138,6 +141,7 @@ def _dsv4_adjust_cfg(**over):
         moe_cache_rate = None
         moe_strategy = "offload"
         max_running_req = 1
+        kv_cap_tokens = None
         cuda_graph_max_bs = 1
         cuda_graph_bs = [1]
         max_seq_len = 1024
@@ -213,6 +217,7 @@ def test_adjust_config_resolves_num_tokens_generic():
         moe_cache_rate = None
         moe_strategy = "auto"
         max_running_req = 4
+        kv_cap_tokens = None
         cuda_graph_max_bs = 2
         cuda_graph_bs = [1, 2]
         max_seq_len = 1024
@@ -253,6 +258,8 @@ def test_mha_kv_cost_simple_full_attention():
         dtype = torch.bfloat16
         page_size = 16
         max_running_req = 4
+        max_seq_len = 262_144
+        kv_cap_tokens = None
         swa_full_tokens_ratio = 0.2
         swa_num_pages_override = None
         model_config = StubModelConfig()
@@ -289,6 +296,8 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         dtype = torch.float16
         page_size = 16
         max_running_req = 4
+        max_seq_len = 262_144
+        kv_cap_tokens = None
         hybrid_swa_cache_mode = "auto"
         memory_ratio = 0.9
         moe_prefill_overlap = True
@@ -445,6 +454,7 @@ def _generic_rotary_cfg(max_position, override):
         moe_cache_rate = None
         moe_strategy = "auto"
         max_running_req = 4
+        kv_cap_tokens = None
         cuda_graph_max_bs = 2
         cuda_graph_bs = [1, 2]
         max_seq_len = 1024
@@ -503,3 +513,56 @@ def test_uncapped_platform_stays_uncapped(monkeypatch):
     if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
         pytest.skip("WSL caps pinning")
     assert _pin_budget_bytes(reserved=2**30) is None
+
+
+PER_EXPERT, PER_PAGE, GIB = 5318656, 24576, 1024 ** 3   # the 122B's own bytes per slot/token
+_PLAN = dict(per_expert_bytes=PER_EXPERT, cache_per_page=PER_PAGE, num_experts=256,
+             total_experts=12288, prefill_overlap=False, max_slots=12288)
+
+
+def test_resolve_kv_cap_pages_takes_the_smaller_bound():
+    cap = lambda reqs, seq, tok, page: resolve_kv_cap_pages(
+        max_running_req=reqs, max_seq_len=seq, kv_cap_tokens=tok, page_size=page)
+    # request limits bind; the token ceiling binds; an explicit ceiling wins; 0 turns it off
+    assert (cap(2, 4096, None, 16), cap(4, 262_144, None, 1), cap(4, 262_144, 4096, 1),
+            cap(4, 262_144, 0, 1)) == (512, DEFAULT_MPS_KV_CAP_TOKENS, 4096, 4 * 262_144)
+
+
+def test_mps_headroom_is_absolute_on_a_big_box_and_the_ratio_on_a_small_one():
+    # on 36 GiB the 0.9 ratio holds back more than the absolute reserve; on 8 GiB it holds
+    # back less than MPS_MIN_FREE_BYTES, so the ratio still wins
+    big = dict(memory_ratio=0.9, baseline_free=36 * GIB, weights_bytes=0, fixed_cache_size=0)
+    small = dict(big, baseline_free=8 * GIB)
+    assert (mps_net_cache_budget_bytes(**big), mps_net_cache_budget_bytes(**small)) == (
+        36 * GIB - MPS_MIN_FREE_BYTES, net_cache_budget_bytes(**small))
+
+
+def test_kv_floor_costs_the_122b_slots_it_can_name():
+    cap = resolve_kv_cap_pages(max_running_req=4, max_seq_len=20480, kv_cap_tokens=None, page_size=1)
+    floor = resolve_kv_floor_pages(max_running_req=4, max_seq_len=20480, page_size=1, kv_cap_pages=cap,
+                                   max_seq_len_override=20480, kv_reserve_tokens=8192)
+    plan = lambda r: plan_cache_budget(budget_bytes=int(17.88 * GIB), kv_reserve_pages=r,
+                                       kv_cap_pages=cap, **_PLAN)
+    # raising the floor to 65536 KV tokens (four 16k answers) costs 265 of 3571 expert slots
+    assert (floor, plan(floor)[1], plan(8192)[0] - plan(floor)[0]) == (65536, 65536, 265)
+
+
+def test_the_disk_tier_reserve_survives_every_device_allocation_it_makes():
+    # DiskMoeCache's staging arena is priced by nothing else in the plan; left out of
+    # fixed_cache_size it spends the reserve (the 122B came up 1.24 of the 1.50 GiB promised)
+    from freetoken.moe.disk_cache import DEFAULT_STAGE_ROWS
+    base, weights, fixed = 28 * GIB, int(7.91 * GIB), int(0.72 * GIB)
+    arena = DEFAULT_STAGE_ROWS * PER_EXPERT
+    free = lambda seen: base - (weights + fixed + arena + required_bytes(*plan_cache_budget(
+        budget_bytes=mps_net_cache_budget_bytes(0.9, base, weights, seen),
+        kv_reserve_pages=65536, kv_cap_pages=65536, **_PLAN)[:2], PER_EXPERT, PER_PAGE))
+    assert free(fixed + arena) >= MPS_MIN_FREE_BYTES > free(fixed)
+
+
+def test_mps_driver_bytes_prices_the_122b_disk_tiers_gigabyte_heap():
+    # 3274 slots / 65536 KV pages, in allocation order: six NVFP4 slot banks, the staging arena,
+    # the KV slab, the GDN pool's two. Read off torch.mps.driver_allocated_memory() in a bare
+    # process, never derived from the code here.
+    sizes = [3274 * n for n in (3145728, 393216, 4096, 1572864, 196608, 6144)] + [
+        32 * PER_EXPERT, 65536 * PER_PAGE, 13271040, 754974720]
+    assert (sum(sizes), mps_driver_bytes(sizes)) == (19962335232, 20176699392)

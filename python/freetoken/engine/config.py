@@ -100,14 +100,6 @@ class EngineConfig:
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
-        # The loader re-runs ``parse_config`` in whichever process reads the checkpoint, so the
-        # override travels in the environment (models/config.set_dense_quant_override) and every
-        # construction path goes through here.
-        from freetoken.models.config import dense_quant_override, set_dense_quant_override
-
-        if self.dense_quant_override == "none":
-            object.__setattr__(self, "dense_quant_override", dense_quant_override())
-        set_dense_quant_override(self.dense_quant_override)
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":
@@ -153,12 +145,18 @@ class EngineConfig:
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
-        from freetoken.layers.quantization import dense_fp8_override
+        if self.dense_quant_override == "fp8":
+            if not is_mps() or not model_config.dense_fp8_modules:
+                raise ValueError(
+                    f"--dense-quant-override fp8 needs Metal and a model family that names its dense "
+                    f"layers; {spec.module} on {'mps' if is_mps() else 'cuda'} has none to override"
+                )
+            from freetoken.layers.quantization import dense_fp8_override
 
-        # --dense-quant-override needs the parsed model to know which dense layers exist, so the
-        # override lands after parse_config and the final QuantConfig is republished.
-        quant = dense_fp8_override(quant, model_config)
-        set_quant_config(quant)
+            # The override needs the parsed model to know which dense layers exist, so it
+            # lands after parse_config and the final QuantConfig is republished.
+            quant = dense_fp8_override(quant, model_config)
+            set_quant_config(quant)
         return replace(model_config, quant=quant)
 
     @property

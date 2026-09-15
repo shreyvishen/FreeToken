@@ -394,7 +394,7 @@ def _no_eos_tokens(n, start=0):
 
 def test_track_snapshot_equals_a_prefill_stopped_at_the_boundary():
     """The snapshot in the donated slot equals the state a prefill truncated at the boundary leaves."""
-    from freetoken.kernel.fla.chunk import CHUNK_SIZE
+    from freetoken.kernel.fla.const import CHUNK_SIZE
 
     torch.manual_seed(17)
     config = _config()
@@ -423,7 +423,7 @@ def test_track_snapshot_equals_a_prefill_stopped_at_the_boundary():
 
 def test_prefix_hit_matches_the_uncached_run():
     """A prefix hit that COW-restores the donated snapshot reproduces the tail of an uncached prefill."""
-    from freetoken.kernel.fla.chunk import CHUNK_SIZE
+    from freetoken.kernel.fla.const import CHUNK_SIZE
 
     torch.manual_seed(18)
     config = _config()
@@ -579,7 +579,7 @@ def _req(table_idx, cached_len, host_ids, extend_len=1):
 
 def test_commit_writes_the_track_slot_at_the_boundary():
     """The donated snapshot must carry the context AT the xCHUNK boundary, not the chunk end."""
-    from freetoken.kernel.fla.chunk import CHUNK_SIZE
+    from freetoken.kernel.fla.const import CHUNK_SIZE
 
     args = _config().qwen4_args
     eos = args.ngram_boundary_token_id

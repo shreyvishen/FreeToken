@@ -48,6 +48,7 @@ def test_dummy_expert_banks_follow_the_kernel_layout(monkeypatch):
     _init_tp()
     L, E, H, I = 3, 4, 64, 32
     monkeypatch.setattr(backend, "device_capability", lambda: (0, 0))
+    monkeypatch.setattr(backend, "is_mps", lambda: False)  # the table is CUDA's here
     monkeypatch.setattr(backend, "is_vllm_installed", lambda: False)
     monkeypatch.setattr(backend, "is_flashinfer_installed", lambda: False)
 

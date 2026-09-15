@@ -34,6 +34,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -206,6 +207,11 @@ def visible_gpu_index() -> int:
 
 
 def free_gpu_memory_gib() -> float:
+    # Darwin has no nvidia-smi: the Metal working set is Torch's own recommended ceiling
+    # minus what the driver already has resident, not a queryable device free counter.
+    if sys.platform == "darwin":
+        headroom = torch.mps.recommended_max_memory() - torch.mps.driver_allocated_memory()
+        return headroom / 1024**3
     result = subprocess.run(
         [
             "nvidia-smi",
@@ -224,7 +230,10 @@ def free_gpu_memory_gib() -> float:
     raise RuntimeError(f"GPU {target} is not visible in nvidia-smi")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="AIME e2e needs CUDA")
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() or torch.backends.mps.is_available()),
+    reason="AIME e2e needs CUDA or MPS",
+)
 def test_aime():
     model_path = _optional_path("FREETOKEN_TEST_MODEL")
     if model_path is None:

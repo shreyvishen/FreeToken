@@ -267,6 +267,7 @@ def test_auto_backend_resolution(monkeypatch):
     assert attention_backend_info("m3_sparse").page_sizes == (128,)
     # the dense leading layers take a FULL backend from the same resolver, filtered to 128-token pages
     monkeypatch.delenv("FREETOKEN_M3_INNER_BACKEND", raising=False)
+    monkeypatch.setattr("freetoken.engine.engine.is_mps", lambda: False)  # the table is CUDA's here
     assert _pick_inner_backend(128) in ("fa,fi", "fi", "triton")
 
 
@@ -277,6 +278,7 @@ def test_nvfp4_experts_restricted_to_triton_for_swigluoai(monkeypatch):
     from freetoken.layers.quantization.moe import Nvfp4MoEMethod
 
     monkeypatch.setattr(backend, "device_capability", lambda: (12, 0))
+    monkeypatch.setattr(backend, "is_mps", lambda: False)  # the table is CUDA's here
     monkeypatch.setattr(backend, "is_vllm_installed", lambda: True)
     monkeypatch.setattr(backend, "is_flashinfer_installed", lambda: True)
     cfg = MoEConfig(num_experts=256, hidden=6144, intermediate=3072, top_k=4, scheme=ModelOptConfig.SCHEMES["NVFP4"], strategy="offload", activation="swigluoai", alpha=1.702, limit=7.0)

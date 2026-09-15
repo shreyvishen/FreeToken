@@ -2,14 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from freetoken.kernel.backend import is_mps
 from freetoken.layers.quantization import QuantConfig, QuantKind
 from freetoken.models.config import (
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
     ModelConfig,
     RotaryConfig,
-    dense_quant_override,
     mrope_layout_from_rope_params,
 )
 from freetoken.models.qwen3_vl.config import parse_vision_config
@@ -39,12 +37,11 @@ def _layer_types(text: Any) -> list[str]:
     ]
 
 
-# What ``--dense-quant-override fp8`` covers.
-_OVERRIDE_ATTN_MODULES = (
+# What ``--dense-quant-override fp8`` covers. The checkpoint's own format always wins:
+# DenseFp8OverrideConfig only fills in where the checkpoint's QuantConfig has no scheme.
+_OVERRIDE_MODULES = (
     ".self_attn.qkv_proj", ".self_attn.o_proj",
     ".linear_attn.in_proj_qkvz", ".linear_attn.out_proj",
-)
-_OVERRIDE_DENSE_MODULES = (
     ".mlp.shared_expert.gate_up_proj", ".mlp.shared_expert.down_proj",
     ".mlp.gate_up_proj", ".mlp.down_proj",
 )
@@ -79,15 +76,6 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
     expert_quant, weight_block_size = _expert_quant(hf_config, text)
-
-    # --dense-quant-override fp8 (Metal only, default off): serve the dense projections the
-    # checkpoint left bf16 as fp8-e4m3 with a per-output-row scale. Naming a module here can
-    # never override a stored format: DenseFp8OverrideConfig asks the checkpoint's own
-    # QuantConfig first and only fills in where it returns no scheme.
-    override = dense_quant_override() if is_mps() else "none"
-    dense_fp8_modules: tuple[str, ...] = (
-        _OVERRIDE_ATTN_MODULES + _OVERRIDE_DENSE_MODULES if override == "fp8" else ()
-    )
 
     # Dense variants (e.g. Qwen3.6-27B) report num_experts==0: route the decoder MLP through
     # the dense Qwen3_5DenseMLP instead of the MoE block.
@@ -164,8 +152,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attention_groups=groups,
         expert_quant=expert_quant,
         weight_block_size=weight_block_size,
-        dense_quant_override=override,
-        dense_fp8_modules=dense_fp8_modules,
+        dense_fp8_modules=_OVERRIDE_MODULES,
     )
 
 
