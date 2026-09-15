@@ -223,6 +223,7 @@ def test_post_terminal_overlap_step_is_dropped():
     assert req.output_len == output_len_before                           # no append
     cm.check_integrity()
 
+
 def test_overlap_delivers_the_whole_output_budget():
     """Under overlap the next step launches before the previous one drains, so a length
     check on device_len ends the request one token early and drops the last one."""

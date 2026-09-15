@@ -92,7 +92,7 @@ def two_node_tree(s: Session) -> Tuple[Sequence[int], int, int]:
                                            (3, False), (48, False), (128, False)])
 def test_page_size_must_divide_chunk_size(page_size, ok):
     """Snapshots land on x CHUNK_SIZE boundaries, so a page must not straddle one."""
-    from freetoken.kernel.fla.chunk import CHUNK_SIZE
+    from freetoken.kernel.fla.const import CHUNK_SIZE
     from freetoken.kvcache.hybrid_radix_cache import HybridRadixCache
 
     assert (CHUNK_SIZE % page_size == 0) is ok, "the parameter table assumed CHUNK_SIZE == 64"

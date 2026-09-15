@@ -1,0 +1,111 @@
+"""DiskMoeCache reading real bytes through both of ExpertReader's backends."""
+
+from __future__ import annotations
+
+import json
+import os
+
+import safetensors.torch
+import torch
+
+from freetoken.moe.disk_cache import PIN_RANK_TOKENS, DiskMoeCache
+from freetoken.moe.expert_reader import PIECE_ORDER, ExpertReader, Nvfp4DiskIndex
+
+GROUP, FP8 = 16, torch.float8_e4m3fn
+NUM_EXPERTS, HIDDEN, INTER, LAYER = 2, 32, 16, 0
+PIECES = {"gate_up_packed", "gate_up_scale", "gate_up_global",
+          "down_packed", "down_scale", "down_global"}
+
+
+def prefix(expert: int, layer: int = LAYER) -> str:
+    return f"model.language_model.layers.{layer}.mlp.experts.{expert}"
+
+
+def write_tiny_checkpoint(tmp_path, num_experts=NUM_EXPERTS, layers=(LAYER,)):
+    os.makedirs(tmp_path, exist_ok=True)
+    g = torch.Generator().manual_seed(0)
+    tensors: dict[str, torch.Tensor] = {}
+    for layer in layers:
+      for e in range(num_experts):
+        for proj, out_dim, in_dim in ((f"{prefix(e, layer)}.gate_proj", INTER, HIDDEN),
+                                      (f"{prefix(e, layer)}.up_proj", INTER, HIDDEN),
+                                      (f"{prefix(e, layer)}.down_proj", HIDDEN, INTER)):
+            tensors[f"{proj}.weight"] = torch.randint(
+                0, 256, (out_dim, in_dim // 2), dtype=torch.uint8, generator=g)
+            tensors[f"{proj}.weight_scale"] = (
+                torch.rand(out_dim, in_dim // GROUP, generator=g) * 4).to(FP8)
+            tensors[f"{proj}.weight_scale_2"] = (torch.rand(1, generator=g) * 0.1)[0]
+    safetensors.torch.save_file(tensors, str(tmp_path / "model.safetensors"))
+    with open(tmp_path / "model.safetensors.index.json", "w") as f:
+        json.dump({"metadata": {}, "weight_map": {n: "model.safetensors" for n in tensors}}, f)
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump({"model_type": "qwen3_5_moe"}, f)
+    return str(tmp_path), tensors
+
+
+def test_index_reader_bytes_match_the_checkpoint(tmp_path):
+    model_path, tensors = write_tiny_checkpoint(tmp_path)
+    expert = 1
+    assert set(Nvfp4DiskIndex(model_path).get(LAYER, expert).pieces()) == PIECES
+
+    cache = DiskMoeCache(num_layers=1, num_experts=NUM_EXPERTS, cache_size=2,
+                         device=torch.device("cpu"), quant_format="nvfp4")
+    cache.set_disk_source(ExpertReader(model_path), HIDDEN, INTER)
+    ids = torch.tensor([[expert]], dtype=torch.int32)
+    cache.ensure_experts(LAYER, ids)
+    cache.copy_missing()
+    slot = int(ids[0, 0])
+
+    raw = lambda proj, kind: tensors[f"{prefix(expert)}.{proj}_proj.weight{kind}"]
+    for bank, kind in (("gate_up_packed", ""), ("gate_up_scale", "_scale")):
+        got = cache.bank_caches[bank][slot]
+        assert torch.equal(got[:INTER], raw("gate", kind)) and torch.equal(
+            got[INTER:], raw("up", kind))
+    assert torch.equal(cache.bank_caches["down_packed"][slot], raw("down", ""))
+    assert torch.equal(cache.bank_caches["down_scale"][slot], raw("down", "_scale"))
+    # the globals are per-tensor f32 on disk and per-output-row fp16 in the banks
+    for bank, proj, rows in (("gate_up_global", "gate", slice(0, INTER)),
+                             ("gate_up_global", "up", slice(INTER, 2 * INTER)),
+                             ("down_global", "down", slice(0, HIDDEN))):
+        want = raw(proj, "_scale_2").to(torch.float16).expand(rows.stop - rows.start)
+        assert torch.equal(cache.bank_caches[bank][slot][rows], want)
+    cache.close()
+
+
+def test_repacked_reader_matches_the_index_reader(tmp_path):
+    from freetoken.checkpoint.repack_nvfp4_experts import build as repack_build
+
+    model_path, _ = write_tiny_checkpoint(tmp_path / "ckpt")
+    repacked_dir = str(tmp_path / "repacked")
+    repack_build(model_path, repacked_dir, layers=[LAYER])
+    index_reader = ExpertReader(model_path)
+    repacked_reader = ExpertReader(model_path, repacked_dir)
+    assert repacked_reader.reads_per_expert == 1 and index_reader.reads_per_expert == 9
+
+    nbytes = [t.nbytes for t in Nvfp4DiskIndex(model_path).get(LAYER, 1).all_locs()]
+    a, b = ([bytearray(n) for n in nbytes] for _ in range(2))
+    index_reader.read_into(LAYER, 1, [memoryview(x) for x in a])
+    repacked_reader.read_into(LAYER, 1, [memoryview(x) for x in b])
+    for name, xa, xb in zip(PIECE_ORDER, a, b):
+        assert bytes(xa) == bytes(xb), name
+    index_reader.close()
+    repacked_reader.close()
+
+
+def test_the_pin_set_holds_the_routing_head_against_eviction(tmp_path):
+    model_path, _ = write_tiny_checkpoint(tmp_path, num_experts=4, layers=(0, 1))
+    cache = DiskMoeCache(num_layers=2, num_experts=4, cache_size=4,
+                         device=torch.device("cpu"), quant_format="nvfp4")
+    cache.set_disk_source(ExpertReader(model_path), HIDDEN, INTER)
+    head = 3
+    for step in range(PIN_RANK_TOKENS):
+        for layer in (0, 1):
+            cache.ensure_experts(layer, torch.tensor([[head, step % 4]], dtype=torch.int32))
+            cache.copy_missing()
+    assert cache._pin_expert.tolist() == [[i == head for i in range(4)]] * 2
+    for expert in [e for e in range(4) if e != head] * 4:
+        for layer in (0, 1):
+            cache.ensure_experts(layer, torch.tensor([[expert]], dtype=torch.int32))
+            cache.copy_missing()
+    assert int(cache._slot_of[0, head]) >= 0 and int(cache._slot_of[1, head]) >= 0
+    cache.close()

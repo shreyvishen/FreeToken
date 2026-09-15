@@ -50,7 +50,7 @@ class CacheSpec:
     @property
     def unsupported(self) -> Optional[str]:
         """Why the class itself rejects this geometry, or None."""
-        from freetoken.kernel.fla.chunk import CHUNK_SIZE
+        from freetoken.kernel.fla.const import CHUNK_SIZE
         if self.kind == "hybrid" and CHUNK_SIZE % self.page_size:
             return (f"HybridRadixCache requires CHUNK_SIZE({CHUNK_SIZE}) % "
                     f"page_size({self.page_size}) == 0")
