@@ -6,7 +6,19 @@ from dataclasses import dataclass
 from typing import Iterator
 
 import torch
-from flashlib.kernels.slot_cache import N_STATS, Stat
+try:
+    from flashlib.kernels.slot_cache import N_STATS, Stat
+except ModuleNotFoundError:
+    # flashlib is Linux-only (pyproject): it pulls in triton, and its slot_cache is a CUDA
+    # kernel.
+    from enum import IntEnum
+
+    class Stat(IntEnum):
+        ACTIVE = 0
+        MISS = 1
+        CALLS = 2
+
+    N_STATS = len(Stat)
 
 # Fuse the per-bank expert copies into a single multi-bank launch (one per copy_missing
 # instead of one per bank). Set FREETOKEN_FUSED_COPY=0 to force the legacy per-bank path

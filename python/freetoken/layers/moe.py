@@ -102,11 +102,32 @@ class MoELayer(BaseOP):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        add_to: torch.Tensor | None = None,
+        shared_nvfp4: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
         assert self.quant_method is not None
-        return self.quant_method.apply(
-            hidden_states, topk_weights, topk_ids, self.quant_method.resident_view(self),
-            layer=self, is_prefill=get_global_ctx().batch.is_prefill,
+        is_prefill = get_global_ctx().batch.is_prefill
+        view = self.quant_method.resident_view(self)
+        fused = None if is_prefill else getattr(self.quant_method.kernel, "apply_fused", None)
+        if fused is not None:
+            return fused(self, hidden_states, topk_weights, topk_ids, view,
+                         base=add_to, shared=shared_nvfp4)
+        assert shared_nvfp4 is None, "shared_nvfp4 needs a kernel with apply_fused"
+        out = self.quant_method.apply(
+            hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill,
+        )
+        return out if add_to is None else out + add_to
+
+    def accepts_shared_nvfp4(self) -> bool:
+        """True when this forward would run a shared expert passed as ``shared_nvfp4`` inside
+        the routed kernels (resident experts, a kernel with ``apply_fused``, TP=1,
+        decode)."""
+        return (
+            self.quant_method is not None
+            and self.quant_method.cfg.strategy == "resident"
+            and getattr(self.quant_method.kernel, "apply_fused", None) is not None
+            and self.tp_size == 1
+            and not get_global_ctx().batch.is_prefill
         )
 
     def routed_forward(
@@ -135,6 +156,8 @@ class MoELayer(BaseOP):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
+        add_to: torch.Tensor | None = None,
+        shared_nvfp4: tuple[torch.Tensor, ...] | None = None,
     ):
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
@@ -142,7 +165,13 @@ class MoELayer(BaseOP):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
-        return self._maybe_all_reduce(self._resident_gemm(hidden_states, topk_weights, topk_ids))
+        if self.tp_size > 1:
+            # The all-reduce sums the ranks' partial routed outputs; a replicated add_to must go
+            # in once, after it.
+            out = self._maybe_all_reduce(self._resident_gemm(hidden_states, topk_weights, topk_ids))
+            return out if add_to is None else out + add_to
+        return self._resident_gemm(hidden_states, topk_weights, topk_ids, add_to, shared_nvfp4)
+
 
 
 class OffloadMoELayer(MoELayer):
@@ -193,13 +222,26 @@ class OffloadMoELayer(MoELayer):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
+        add_to: torch.Tensor | None = None,
     ):
         ctx = get_global_ctx()
         if ctx.batch.is_prefill:
             final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         else:
             final_hidden_states = self.decode_forward(hidden_states, router_logits)
-        return self._maybe_all_reduce(final_hidden_states)
+        out = self._maybe_all_reduce(final_hidden_states)
+        # Same contract as MoELayer.forward; the offload kernels have no base epilogue.
+        return out if add_to is None else out + add_to
+
+    def predict_from_router(self, router_logits: torch.Tensor) -> None:
+        """Hand the disk tier the top-k this layer will route to, predicted a layer early."""
+        self.offload_cache.predict_experts(
+            self.layer_id, torch.topk(router_logits, self.top_k, dim=-1).indices
+        )
+
+    def issue_from_prediction(self) -> None:
+        """Start the reads the previous layer's :meth:`predict_from_router` named."""
+        self.offload_cache.issue_prediction(self.layer_id)
 
     def routed_forward(
         self,
@@ -284,7 +326,7 @@ class OffloadMoELayer(MoELayer):
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
-        return self._expert_gemm(
+        out = self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
@@ -294,6 +336,12 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+        # The disk tier commits the GEMV so it runs while the host issues the rest of
+        # the layer (DiskMoeCache.kick_queue); other caches have no such method.
+        kick = getattr(cache, "kick_queue", None)
+        if kick is not None:
+            kick()
+        return out
 
     def _decode_hybrid(
         self,
@@ -356,6 +404,14 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        if getattr(cache, "prefill_on_demand", False):
+            # Disk-backed prefill fetches only the experts this batch actually routes to.
+            cache.ensure_experts(self.layer_id, topk_ids, prefill=True)
+            cache.copy_missing()
+            return self._expert_gemm(
+                cache, hidden_states, topk_weights, topk_ids, views=cache.bank_views(), n=None,
+                alphas=cache.alphas_for_slots(self.layer_id), is_prefill=True,
+            )
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
