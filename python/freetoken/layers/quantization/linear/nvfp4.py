@@ -16,10 +16,45 @@ from .base import LinearConfig, LinearKernel, LinearMethod
 FP8 = torch.float8_e4m3fn
 
 
+class MetalNvfp4LinearKernel(LinearKernel):
+    """W4A16 through the Metal GEMV (``kernel/metal/nvfp4_linear``), on the native rows."""
+
+    name = "metal"
+    mps_only = True
+
+    def unusable_reason(self, cfg: LinearConfig) -> str | None:
+        return None if backend.is_mps() else "the Metal nvfp4 GEMV needs torch mps"
+
+    def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.metal.nvfp4_linear import nvfp4_dense_linear
+
+        # The LM head's logits stay float32, explicitly: the sampler and the logit
+        # processors run in float32 and rounding the head's output to bf16 moves greedy ids.
+        out_dtype = torch.float32 if hasattr(layer, "num_embeddings") else None
+        return nvfp4_dense_linear(x, layer.weight, layer.weight_scale, layer.weight_global,
+                                  layer.bias, out_dtype=out_dtype)
+
+    def apply_fused(self, layer: Any, x: torch.Tensor, *, gate=None, swiglu: bool = False,
+                    side_gate_weight=None):
+        """``gate`` is one pre-sigmoid scalar per row, applied in the GEMV's epilogue."""
+        from freetoken.kernel.metal.nvfp4_linear import nvfp4_dense_linear, nvfp4_dense_swiglu
+
+        if swiglu:
+            assert layer.bias is None, "the swiglu epilogue applies no bias"
+            return nvfp4_dense_swiglu(x, layer.weight, layer.weight_scale, layer.weight_global,
+                                      side_gate_weight=side_gate_weight)
+        assert side_gate_weight is None, "side_gate_weight rides the swiglu epilogue"
+        return nvfp4_dense_linear(x, layer.weight, layer.weight_scale, layer.weight_global,
+                                  layer.bias, gate=gate)
+
+
 class TritonNvfp4LinearKernel(LinearKernel):
     """W4A16 on the K-major resident layout."""
 
     name = "triton"
+
+    def unusable_reason(self, cfg: LinearConfig) -> str | None:
+        return backend.triton_unusable_reason()
 
     def finalize(self, layer: Any) -> None:
         from freetoken.kernel.triton.nvfp4_linear import nvfp4_transpose_resident
@@ -111,7 +146,7 @@ class EmulationNvfp4LinearKernel(LinearKernel):
 
 @register_method(QuantKind.NVFP4, LayerKind.LINEAR)
 class Nvfp4LinearMethod(LinearMethod):
-    candidates = (TritonNvfp4LinearKernel, MarlinNvfp4LinearKernel, EmulationNvfp4LinearKernel)
+    candidates = (MetalNvfp4LinearKernel, TritonNvfp4LinearKernel, MarlinNvfp4LinearKernel, EmulationNvfp4LinearKernel)
 
     def create_weights(self, layer: Any) -> None:
         g = self.cfg

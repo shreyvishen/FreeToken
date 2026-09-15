@@ -34,7 +34,9 @@ def select_kernel(candidates: Sequence[type], requested: str, cfg: Any):
         kernel = cls()
         reason = kernel.unusable_reason(cfg)
         if reason:
-            skipped.append(f"{kernel.name}: {reason}")
+            # the Metal kernels lead their tables, so off Metal their skip is no news
+            if not getattr(cls, "mps_only", False):
+                skipped.append(f"{kernel.name}: {reason}")
             continue
         if kernel.worth_it(cfg):
             if skipped:

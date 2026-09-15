@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from freetoken.kernel import backend
+
 from ..registry import LayerKind, register_method
 from ..scheme import FP8_BLOCK as BLOCK, QuantKind
 from .base import BankSpec, ExpertView, fused_piece, gated_epilogue_reason, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
@@ -21,6 +23,9 @@ class TritonFp8BlockMoEKernel(MoEKernel):
     name = "triton"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
+        reason = backend.triton_unusable_reason()
+        if reason:
+            return reason
         reason = self._common_reject(cfg, resident_ok=True, tp_ok=False, cpu_ok=False, plain_silu_only=False)
         if reason:
             return reason
