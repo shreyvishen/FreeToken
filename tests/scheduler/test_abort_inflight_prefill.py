@@ -222,3 +222,20 @@ def test_post_terminal_overlap_step_is_dropped():
     assert [m for m in sent if isinstance(m, DetokenizeMsg)] == terminal  # no 2nd msg
     assert req.output_len == output_len_before                           # no append
     cm.check_integrity()
+
+def test_overlap_delivers_the_whole_output_budget():
+    """Under overlap the next step launches before the previous one drains, so a length
+    check on device_len ends the request one token early and drops the last one."""
+    from freetoken.message import DetokenizeMsg
+
+    pool, cm, tm, dm, _pm, sent, stub = _setup()
+    req = _launch_req(pool, cm, tm, torch.arange(1, 13, dtype=torch.int32), track_seqlen=8)
+    for phase in ("prefill", "decode", "decode", "decode"):  # output_len is 4
+        if req.can_decode:  # the next step is in flight before this drain
+            cm.allocate_paged([req])
+            req.complete_one()
+            dm.filter_reqs([req])
+        Scheduler._process_last_data(stub, _as_last_data(Batch(reqs=[req], phase=phase)))
+    msgs = [m for m in sent if isinstance(m, DetokenizeMsg)]
+    assert len(msgs) == 4 and msgs[-1].finished and msgs[-1].finish_reason == "length"
+    cm.check_integrity()
