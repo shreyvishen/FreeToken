@@ -3,10 +3,13 @@ byte buffers, from either on-disk layout."""
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import re
+import struct
+import sys
 import threading
 from dataclasses import dataclass
 
@@ -18,6 +21,10 @@ logger = init_logger(__name__)
 
 # Alignment the repack pads its records to, and the alignment direct I/O needs.
 _PAGE = 4096
+
+# F_RDADVISE (Darwin <sys/fcntl.h>): an async read of a byte range with no copy to user, which
+# Python's fcntl lacks. Argument: struct radvisory {off_t ra_offset; int ra_count}.
+_F_RDADVISE = 44
 
 _KEY_RE = re.compile(
     r"model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
@@ -33,21 +40,6 @@ PIECE_ORDER = (
     "gate_weight", "gate_scale", "gate_global", "up_weight", "up_scale", "up_global", "down_weight",
     "down_scale", "down_global",
 )
-
-_SAFETENSORS_DTYPE_TO_NUMPY = {
-    "F64": np.float64,
-    "F32": np.float32,
-    "F16": np.float16,
-    "BF16": np.uint16,  # numpy has no bfloat16; caller must reinterpret
-    "I64": np.int64,
-    "I32": np.int32,
-    "I16": np.int16,
-    "I8": np.int8,
-    "U8": np.uint8,
-    "BOOL": np.bool_,
-    "F8_E4M3": np.uint8,  # numpy has no fp8; stored as raw bytes
-    "F8_E5M2": np.uint8,
-}
 
 
 def config_sha(model_path: str) -> str:
@@ -65,13 +57,6 @@ class TensorLoc:
     nbytes: int
     dtype: str  # safetensors dtype string, e.g. "U8", "F8_E4M3", "F16"
     shape: tuple[int, ...]
-
-    def read(self) -> np.ndarray:
-        """One read of this tensor's exact byte range, as an array of its real dtype."""
-        with open(self.shard_path, "rb") as f:
-            f.seek(self.offset)
-            raw = f.read(self.nbytes)
-        return np.frombuffer(raw, dtype=_SAFETENSORS_DTYPE_TO_NUMPY[self.dtype]).reshape(self.shape)
 
 
 @dataclass(frozen=True)
@@ -149,12 +134,6 @@ class Nvfp4DiskIndex:
             for key, fields in raw.items()
         }
 
-    def __len__(self) -> int:
-        return len(self._experts)
-
-    def __contains__(self, key: tuple[int, int]) -> bool:
-        return key in self._experts
-
     def layers(self) -> list[int]:
         return sorted({layer for layer, _ in self._experts})
 
@@ -178,6 +157,7 @@ class ExpertReader:
         self._fd_lock = threading.Lock()
         self._entries: dict[tuple[int, int], tuple[int, int]] | None = None
         self._index: Nvfp4DiskIndex | None = None
+        self._hint = sys.platform == "darwin"
         if repacked_dir and os.path.isdir(repacked_dir):
             with open(os.path.join(repacked_dir, "experts.index.json"), encoding="utf-8") as f:
                 meta = json.load(f)
@@ -214,12 +194,32 @@ class ExpertReader:
                 fd = self._fds.get(path)
                 if fd is None:
                     fd = os.open(path, os.O_RDONLY)
+                    # Paired with the F_RDADVISE hints: drop this call to measure them against
+                    # a warm page cache instead.
                     set_nocache_fd(fd)
                     self._fds[path] = fd
         return fd
 
+    def hint(self, layer: int, expert: int) -> None:
+        """Ask the drive to start fetching this expert's bytes now. Best-effort: the first
+        ``OSError`` (EINVAL on some descriptors) turns the hint off for this reader."""
+        if not self._hint:
+            return
+        try:
+            if self._entries is None:
+                for piece in self._index.get(layer, expert).all_locs():
+                    fcntl.fcntl(self._fd(piece.shard_path), _F_RDADVISE,
+                                struct.pack("qi", piece.offset, piece.nbytes))
+            else:
+                offset, size = self._entries[(layer, expert)]
+                fcntl.fcntl(self._bin_fd, _F_RDADVISE, struct.pack("qi", offset, size))
+        except OSError as err:
+            self._hint = False
+            logger.warning(f"MoE disk tier: readahead hint refused ({err}); hints off")
+
     def read_into(self, layer: int, expert: int, dests: list[memoryview]) -> None:
         """Fill ``dests``, nine writable byte views in :data:`PIECE_ORDER`."""
+        self.hint(layer, expert)
         if self._entries is None:
             loc = self._index.get(layer, expert)
             for name, dest in zip(PIECE_ORDER, dests):
