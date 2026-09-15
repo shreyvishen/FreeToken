@@ -54,3 +54,51 @@ curl http://127.0.0.1:1919/v1/chat/completions -H 'Content-Type: application/jso
 ```
 
 Then head to [quickstart.md](quickstart.md).
+
+## macOS (Apple Silicon)
+
+- Apple Silicon, macOS 26
+- Python 3.14, with [uv](https://docs.astral.sh/uv/)
+- torch 2.10, with MPS (2.10 is the release the Metal path is verified on; do not upgrade it)
+
+```bash
+git clone https://github.com/FlashML-org/FreeToken.git && cd FreeToken
+uv venv .venv --python /opt/homebrew/bin/python3 --system-site-packages
+source .venv/bin/activate
+uv pip install -e .
+ft --help
+```
+
+- On the Metal SSD tier the top tenth of each layer's experts by routing count stays pinned
+  against eviction, and the KV pool is capped at the smaller of 65,536 tokens and
+  `max_running_requests x max_seq_len` so the rest of the budget stays free for the expert
+  cache.
+- The Metal SSD tier reserves 1.5 GiB of host memory it will not spend on expert slots
+  (`engine/cache_budget.py`'s `MPS_MIN_FREE_BYTES`), the measured knee between hit rate and
+  ms/step on a 36 GiB Mac.
+- `--dense-quant-override {none,fp8}` defaults to `none`. `fp8` quantizes to fp8-e4m3, at load,
+  whichever dense weights (attention, GDN, shared expert) a checkpoint left bf16, freeing that
+  memory to the SSD tier's resident-expert budget. It trades a measured 2.63% relative weight
+  error for roughly 2x decode on a checkpoint with a large bf16 dense backbone (the 122B); a
+  checkpoint whose dense weights already ship quantized (the 35B) sees no effect. Off by
+  default because it is lossy and the effect on real generations is not yet evaluated past a
+  three-prompt token-agreement check.
+- The Metal SSD tier holds the top tenth of each layer's experts by routing count against
+  eviction. It ranks them from this server's own routing after 64 decode tokens and re-ranks
+  at every doubling of that window, so nothing is read or written outside the checkpoint.
+- On the Metal SSD tier, `--max-seq-len-override` raises the KV pool's floor to
+  `max_running_requests x max_seq_len` (capped at 65,536 tokens), so a long generation does
+  not get truncated by the disk tier's default KV-starved sizing; it costs expert slots in
+  exchange (265 of 3,571 on the 122B at the default `max_running_requests`).
+
+Darwin gets its own dependency markers in `pyproject.toml`: `flashlib` (Linux only, it pulls
+in triton) is not installed, and torch's floor is `>=2.10,<2.12` on Darwin against
+`>=2.11,<2.12` everywhere else.
+
+**Supported today:** the engine imports cleanly (`import freetoken.engine`), and the CPU-only
+test suites pass (`tests/kvcache`, `tests/scheduler`, `tests/server`, `tests/tokenizer`).
+
+**Not supported yet:** serving a model. There is no Metal attention backend and no
+torch-fallback for fused RMSNorm, so booting an `Engine` with a real config stops at the
+first triton-backed kernel import. NVFP4 kernels and the GDN/attention ops needed for a first
+token are under review in follow-up PRs.
