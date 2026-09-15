@@ -33,10 +33,7 @@ def _cuda_runtime_paths() -> tuple[list[str], list[str]]:
     return [str(cuda_home / "include")], library_dirs
 
 
-# Apple silicon runs the Metal path: torch.mps needs no cudart, and _pinned_tensor /
-# _cpu_moe exist only to serve the PCIe hop that unified memory does not have. Without
-# this, `pip install .` on macOS dies in _cuda_runtime_paths before any package code
-# runs. Every other platform keeps CUDA_HOME as a hard requirement.
+# macOS without CUDA runs the Metal path, which needs neither cudart nor these extensions.
 BUILD_CUDA_EXTENSIONS = not (sys.platform == "darwin" and CUDA_HOME is None)
 
 if BUILD_CUDA_EXTENSIONS:
