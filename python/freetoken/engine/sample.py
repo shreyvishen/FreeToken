@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
 
 import torch
+from freetoken.kernel import backend
 from freetoken.utils import is_sm90_supported, nvtx_annotate
 
 if TYPE_CHECKING:
@@ -16,10 +17,15 @@ class BatchSamplingArgs:
     top_k: torch.Tensor | None = None
     top_p: torch.Tensor | None = None
     greedy_mask: torch.Tensor | None = None
+    # The batch's largest per-row top_k, kept from the host list ``prepare`` already has.
+    top_k_max: int | None = None
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    return torch.tensor(data, dtype=dtype, pin_memory=True).to(device, non_blocking=True)
+    # The host tensor is unreferenced the moment this returns, so the copy has to have
+    # landed by then -- or the source has to be held until it has (backend.stage_h2d).
+    host = torch.tensor(data, dtype=dtype, pin_memory=backend.PIN_MEMORY)
+    return host.to(device, non_blocking=backend.stage_h2d(host))
 
 
 def sample_impl(
@@ -27,10 +33,21 @@ def sample_impl(
     temperatures: torch.Tensor,
     top_k: torch.Tensor | int | None,
     top_p: torch.Tensor | float | None,
+    top_k_max: int | None = None,
 ) -> torch.Tensor:
     from freetoken.kernel.backend import is_flashinfer_installed
 
-    if is_flashinfer_installed():
+    if logits.device.type == "mps":
+        # Apple GPU: neither flashinfer nor triton runs here.
+        import freetoken.kernel.metal.sampling as sampling
+
+        # With k a small fraction of the vocabulary, one topk and k-wide math beats the probs
+        # path, which sorts all V twice.
+        if top_k is not None and top_k_max is not None and top_k_max * 8 <= logits.shape[-1]:
+            return sampling.top_k_top_p_sample_from_logits(
+                logits, temperatures, top_k, top_p, top_k_max
+            )
+    elif is_flashinfer_installed():
         import flashinfer.sampling as sampling
     else:
         import freetoken.kernel.triton.sampling as sampling
@@ -83,14 +100,18 @@ class Sampler:
         greedy_mask = (
             make_device_tensor(is_greedy, torch.bool, self.device) if any(is_greedy) else None
         )
-        return BatchSamplingArgs(temperatures, top_k=top_k, top_p=top_p, greedy_mask=greedy_mask)
+        return BatchSamplingArgs(
+            temperatures, top_k=top_k, top_p=top_p, greedy_mask=greedy_mask, top_k_max=max(top_ks)
+        )
 
     @nvtx_annotate("Sampler")
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
-        with torch.cuda.nvtx.range("Sampler"):
+        with backend.nvtx_range("Sampler"):
             if args.temperatures is None:  # greedy sampling
                 return torch.argmax(logits, dim=-1)
-            tokens = sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)
+            tokens = sample_impl(
+                logits.float(), args.temperatures, args.top_k, args.top_p, args.top_k_max
+            )
             if args.greedy_mask is not None:
                 # Mixed batches still run probability sampling for all rows, but
                 # greedy rows must follow argmax's deterministic tie-breaking.

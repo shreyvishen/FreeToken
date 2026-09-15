@@ -9,6 +9,8 @@ from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
 import torch
+
+from freetoken.kernel import backend as device_backend
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
@@ -23,6 +25,7 @@ from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.host_banks import PinFailed
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
+from freetoken.kernel.backend import is_mps
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
@@ -37,13 +40,24 @@ from freetoken.kvcache.linear_state_pool import (
 
 logger = init_logger(__name__)
 
-def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
+
+def _require_offload_cache_size(
+    cache_size: int, num_experts: int, *, decode_slot: bool = False
+) -> None:
     """The offload MoE cache needs at least one slot per expert per layer. A too-small size
-    (e.g. a bare offload run with moe_cache_size unset and auto disabled) must fail loudly."""
-    if cache_size < num_experts:
+    (e.g. a bare offload run with moe_cache_size unset and auto disabled) must fail loudly.
+
+    ``decode_slot``: the disk tier (``DiskMoeCache``) reserves slots ``[0, num_experts)`` for
+    its prefill window and needs at least one more above it for the decode LRU
+    (``set_disk_source`` raises if not); the floor here must match that or a tight budget
+    reaches ``DiskMoeCache`` construction and fails there instead, three frames deep."""
+    floor = num_experts + 1 if decode_slot else num_experts
+    if cache_size < floor:
         raise ValueError(
-            f"moe_cache_size={cache_size} is too small: need at least num_experts={num_experts} "
-            f"slots. Pass --moe-cache-size/--moe-cache-rate, or use --moe-cache-auto "
+            f"moe_cache_size={cache_size} is too small: need at least {floor} slots "
+            f"(one per expert, num_experts={num_experts}"
+            + (" plus one decode slot above the disk tier's prefill window" if decode_slot else "")
+            + f"). Pass --moe-cache-size/--moe-cache-rate, or use --moe-cache-auto "
             f"(the default for offload/hybrid backends when no cache-sizing flag is given; "
             f"--moe-strategy cpu always sizes its own fixed two-layer buffer and ignores "
             f"cache-sizing flags)."
@@ -138,6 +152,7 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
         candidates.append(("triton", True))
     if AttnType.FULL in required:
         candidates += [
+            ("metal", is_mps()),
             ("trtllm", is_sm100_family()),
             ("fa,fi", is_sm90_family()),
             ("fi", True),
@@ -326,7 +341,7 @@ class ForwardOutput(NamedTuple):
 
 class Engine:
     def __init__(self, config: EngineConfig):
-        assert not torch.cuda.is_initialized()
+        assert device_backend.is_mps() or not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         set_quant_backend(_adjust_ftw_quant_backend(config.model_path, QuantBackend.parse(config.quant_backend)))
         _ensure_expandable_segments()  # before the first CUDA allocation below
@@ -336,8 +351,8 @@ class Engine:
         self.device = bind_assigned_gpu(config.tp_info.rank)
         _adjust_config(config)
         torch.manual_seed(42)
-        self.stream = torch.cuda.Stream()
-        torch.cuda.set_stream(self.stream)
+        self.stream = device_backend.Stream()
+        device_backend.set_stream(self.stream)
         self.dtype = config.dtype
         self.config = config  # retained for runtime cache rebuild (rebuild_runtime_cache)
         # KV pool family fixed at construction from the model config: its classmethods own the
@@ -385,6 +400,13 @@ class Engine:
         if hasattr(self.model, "load_host_tables"):
             with _weight_load_context():
                 self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
+        # Resident quantized experts whose banks are too large for a CPU state_dict: the model
+        # streams them straight onto the device. Offload models never reach the hook.
+        if not is_offload_moe_strategy(config.moe_strategy) and hasattr(
+            self.model, "load_resident_experts"
+        ):
+            with _weight_load_context():
+                self.model.load_resident_experts(config)
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -417,6 +439,16 @@ class Engine:
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
+        # The KV pool is ONE slab and Metal caps a single buffer well below the working set,
+        # so a budget taken from free memory alone asks for a tensor the driver refuses
+        # ("Invalid buffer size") with memory to spare. Clamp to what one allocation can be.
+        max_slab = device_backend.max_single_alloc_bytes()
+        if max_slab is not None and available_memory > max_slab:
+            logger.info_rank0(
+                f"KV budget {mem_GB(available_memory)} exceeds the largest single "
+                f"{device_backend.device_type()} buffer {mem_GB(max_slab)}; clamping to it"
+            )
+            available_memory = max_slab
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
@@ -491,6 +523,7 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            max_running_req=config.max_running_req,
             mrope=config.model_config.model_is_mrope,
         )
         if config.attention_backend.split(",")[0] == "triton":
@@ -553,12 +586,23 @@ class Engine:
             device=self.device,
         )
 
+    def _kv_cap_pages(self, config: EngineConfig, page_tokens: int) -> int | None:
+        """KV page ceiling for the one-pool plan, or None to keep the greedy CUDA split."""
+        if not is_mps():
+            return None
+        from freetoken.engine.cache_budget import resolve_kv_cap_pages
+
+        return resolve_kv_cap_pages(
+            max_running_req=config.max_running_req, max_seq_len=config.max_seq_len,
+            kv_cap_tokens=config.kv_cap_tokens, page_size=page_tokens,
+        )
+
     @torch.inference_mode()
     def _warmup_encoders(self) -> None:
         for item in self.mm_processor.dummy_items(self.dtype, self.device):
             if item.modality in self.config.served_modalities:
                 self.model.encode(item)
-        torch.cuda.synchronize(self.device)
+        device_backend.synchronize(self.device)
 
     @torch.inference_mode()
     def _run_mm_encoder(self, batch: Batch) -> None:
@@ -572,7 +616,10 @@ class Engine:
         for item in jobs:
             if not cache.has(item.hash):
                 if item.precomputed_embeddings is not None:
-                    emb = item.precomputed_embeddings.to(self.device, non_blocking=True)
+                    host_emb = item.precomputed_embeddings
+                    emb = host_emb.to(
+                        self.device, non_blocking=device_backend.stage_h2d(host_emb)
+                    )
                 else:
                     emb = self.model.encode(item)
                 cache.put(item.hash, emb)
@@ -611,9 +658,133 @@ class Engine:
             kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
             page_size=page_tokens,
             max_slots=method.slot_limit() if method is not None else None,
+            kv_cap_pages=self._kv_cap_pages(config, page_tokens),
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
+        if is_mps() and getattr(config.model_config, "expert_quant", "none") == "nvfp4":
+            # Metal offload: NVFP4 expert slots on the device, source bytes on the SSD --
+            # the host banks the CUDA path loads first would be the same physical RAM here.
+            from freetoken.engine.cache_budget import (
+                mps_driver_bytes,
+                mps_net_cache_budget_bytes,
+                plan_cache_budget,
+                resolve_kv_floor_pages,
+            )
+            from freetoken.kvcache.linear_state_pool import state_pool_alloc_sizes
+            from freetoken.moe.disk_cache import (
+                DEFAULT_STAGE_ROWS,
+                DiskMoeCache,
+            )
+            from freetoken.moe.expert_reader import ExpertReader
+
+            mc = config.model_config
+            # the expert kernel owns the bank layout; the tier only needs its shapes and dtypes
+            layout = shared_offload_method(self.model).layout()
+            specs = {
+                role: ((mc.num_experts, *spec.shape), spec.dtype)
+                for role, spec in layout.items() if not spec.resident
+            }
+            row_bytes = [
+                math.prod(shape[1:]) * torch.empty((), dtype=dtype).element_size()
+                for shape, dtype in specs.values()
+            ]
+            per_expert_bytes = sum(row_bytes)
+            total_experts = mc.num_moe_layers * mc.num_experts
+            cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
+            fixed_cache_size += state_pool_bytes(config)
+            # DiskMoeCache's device staging arena, allocated by set_disk_source below and
+            # invisible to a plan counting only slot banks and KV pages; left out of the fixed
+            # cost it comes straight off the host reserve.
+            arena_bytes = DEFAULT_STAGE_ROWS * per_expert_bytes
+            fixed_cache_size += arena_bytes
+            # Every bank is one slab, so no bank may exceed the Metal per-buffer cap.
+            max_slots = min(total_experts, device_backend.max_single_alloc_bytes() // max(row_bytes))
+            if config.moe_cache_size > 0:
+                # An explicit --moe-cache-size still goes through the one-pool plan, as its own
+                # slot cap, else the KV sizer takes everything the smaller expert cache left.
+                max_slots = min(max_slots, config.moe_cache_size)
+            # plan_cache_budget and not resolve_moe_cache_auto: the latter derives its own slot
+            # cap from the quant format, discarding the two caps that bind here.
+            kv_cap_pages = self._kv_cap_pages(config, page_tokens)
+            kv_floor_pages = resolve_kv_floor_pages(
+                max_running_req=config.max_running_req, max_seq_len=config.max_seq_len,
+                max_seq_len_override=config.max_seq_len_override,
+                kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve), page_size=page_tokens,
+                kv_cap_pages=kv_cap_pages,
+            )
+            # The plan counts nominal bytes and the MPS allocator charges by heap, so the gap is
+            # memory the reserve was paying for (mps_driver_bytes).
+            state_sizes = state_pool_alloc_sizes(config)
+            overhead = 0
+            for _ in range(4):
+                budget = mps_net_cache_budget_bytes(
+                    config.memory_ratio, self._baseline_free, self._weights_bytes,
+                    fixed_cache_size + overhead,
+                )
+                size, pages, _overlap = plan_cache_budget(
+                    # MPS-only, so the headroom is the absolute reserve, not the ratio's
+                    # fraction of the box: every byte above it is an expert slot.
+                    budget_bytes=budget,
+                    per_expert_bytes=per_expert_bytes,
+                    cache_per_page=cache_per_page,
+                    num_experts=mc.num_experts,
+                    total_experts=total_experts,
+                    prefill_overlap=False,
+                    kv_reserve_pages=kv_floor_pages,
+                    max_slots=max_slots,
+                    kv_cap_pages=kv_cap_pages,
+                )
+                # Every device allocation the tier and its sibling pools make, in order: the
+                # slot banks, the staging arena, the KV slab, the GDN state.
+                sizes = [size * rb for rb in row_bytes]
+                sizes += [arena_bytes, pages * cache_per_page, *state_sizes]
+                settled = max(overhead, mps_driver_bytes(sizes) - sum(sizes))
+                if settled == overhead:
+                    break
+                overhead = settled
+            object.__setattr__(config, "moe_cache_size", size)
+            if config.num_page_override is None:
+                object.__setattr__(config, "num_page_override", pages)
+            _require_offload_cache_size(config.moe_cache_size, mc.num_experts, decode_slot=True)
+            logger.info_rank0(
+                f"MoE disk tier: {size} slots x {per_expert_bytes} B = "
+                f"{mem_GB(size * per_expert_bytes)} on device, "
+                f"{size / total_experts:.1%} of {total_experts} experts resident; "
+                f"{pages} KV pages x {cache_per_page} B = {mem_GB(pages * cache_per_page)} "
+                f"({pages * page_tokens} tokens, floor {kv_floor_pages} cap {kv_cap_pages} pages) "
+                f"from the same {mem_GB(budget)} pool"
+            )
+            logger.info_rank0(
+                f"MoE disk tier plan: baseline {mem_GB(self._baseline_free)}, weights "
+                f"{mem_GB(self._weights_bytes)}, fixed cache {mem_GB(fixed_cache_size)}, "
+                f"heap overhead {mem_GB(overhead)}, "
+                f"free now {mem_GB(device_backend.free_memory())}, budget {mem_GB(budget)}"
+            )
+            cache = DiskMoeCache(
+                num_layers=mc.num_moe_layers,
+                num_experts=mc.num_experts,
+                cache_size=size,
+                device=self.device,
+                cache_policy=config.moe_cache_policy,
+                # The double buffer needs pinned host banks and a copy stream, neither of which
+                # exists here; prefill materializes each layer synchronously instead.
+                prefill_overlap=False,
+                quant_format="nvfp4",
+            )
+            repack = f"{config.model_path}-expertmajor"
+            cache.set_disk_source(
+                ExpertReader(config.model_path, repack), mc.hidden_size, mc.moe_intermediate_size,
+            )
+            logger.info_rank0(
+                f"MoE disk tier: free after the slot banks {mem_GB(device_backend.free_memory())}"
+            )
+            cache.collect_stats = config.moe_collect_stats
+            layers = attach_offload_moe_cache(self.model, cache)
+            assert len(layers) == mc.num_moe_layers
+            self.ctx.moe_offload_cache = cache
+            self.moe_offload_cache = cache
+            return cache
         method = shared_offload_method(self.model)
         num_moe_layers = config.model_config.num_moe_layers
         cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=self._host_tables_bytes, method=method)
@@ -810,9 +981,9 @@ class Engine:
 
     def _sync_get_memory(self) -> Tuple[int, int]:
         """Get the min and max free memory across TP ranks."""
-        torch.cuda.synchronize(self.device)
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(self.device)
+        device_backend.synchronize(self.device)
+        device_backend.empty_cache()
+        device_backend.reset_peak_memory_stats(self.device)
         free_memory = get_free_memory(self.device)
         free_mem_tensor = torch.tensor([free_memory, -free_memory], device="cpu", dtype=torch.int64)
         torch.distributed.all_reduce(
@@ -958,7 +1129,7 @@ class Engine:
             ),
         )
 
-        torch.cuda.synchronize(self.device)
+        device_backend.synchronize(self.device)
         # Preserve the CUDA-graph batch-size set resolved at startup. The auto heuristic keys
         # off free memory, which is far smaller now that the caches are resident (post-cache
         # free << startup pre-load free), so re-deriving it here would silently drop large
@@ -1014,11 +1185,12 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            max_running_req=config.max_running_req,
             mrope=config.model_config.model_is_mrope,
         )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
-        assert torch.cuda.current_stream() == self.stream
+        assert device_backend.current_stream() == self.stream
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
@@ -1035,7 +1207,7 @@ class Engine:
         batch_logits = logits[: batch.size]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
-        copy_done_event = torch.cuda.Event()
+        copy_done_event = device_backend.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
@@ -1060,8 +1232,8 @@ class Engine:
 
         dummy_row = self.page_table[self.dummy_req.table_idx]
         dummy_slot = int(dummy_row[0].item())
-        started = torch.cuda.Event(enable_timing=True)
-        ended = torch.cuda.Event(enable_timing=True)
+        started = device_backend.Event(enable_timing=True)
+        ended = device_backend.Event(enable_timing=True)
         started.record(self.stream)
         try:
             for length in warmup_lens:
@@ -1094,7 +1266,7 @@ class Engine:
             if self.moe_offload_cache is not None:
                 self.moe_offload_cache.reset()
         ended.record(self.stream)
-        torch.cuda.synchronize(self.device)
+        device_backend.synchronize(self.device)
         logger.info_rank0(
             f"Prefill warmup complete for lengths {warmup_lens} "
             f"in {started.elapsed_time(ended) / 1000.0:.3f} s"
@@ -1102,13 +1274,17 @@ class Engine:
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
+        # DiskMoeCache owns a pread thread pool and open SSD fds (disk_cache.py); the base
+        # OffloadMoeCache has neither and no close(), so only call it when it exists.
+        if self.moe_offload_cache is not None and hasattr(self.moe_offload_cache, "close"):
+            self.moe_offload_cache.close()
         torch.distributed.destroy_process_group()
         destroy_distributed()
 
 
 def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
     """(name, uuid) of visible device ``index`` (default: the current, i.e. bound, device); (None, None) without CUDA."""
-    if not torch.cuda.is_available():
+    if not device_backend.is_cuda():
         return None, None
     ident = gpu_identity(torch.cuda.current_device() if index is None else index)
     return ident["name"], ident["uuid"]
@@ -1162,6 +1338,8 @@ def _ensure_expandable_segments() -> None:
     caller guarantees CUDA is not yet initialized). Any user-provided allocator config
     is respected and left untouched.
     """
+    if not device_backend.is_cuda():
+        return  # no CUDA allocator to configure
     if os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
         return
     try:
@@ -1177,6 +1355,14 @@ def _resolve_cache_type(has_linear_attention: bool, requested: str) -> str:
     # boundaries -> cross-request prefix reuse). An explicit ``--cache-type naive`` opts out
     # to the old no-reuse path (debugging / parity baseline / lower GDN-state memory).
     if has_linear_attention:
+        if requested != "naive" and is_mps():
+            # HybridRadixCache snapshots GDN state from the per-chunk ``h`` the fla chunked
+            # kernel returns; the Metal GDN kernel is sequential in T and produces no ``h``.
+            logger.info_rank0(
+                "hybrid_radix needs the fla chunked kernel's per-chunk state, which "
+                "the Metal GDN kernel does not produce; using cache_type='naive'"
+            )
+            return "naive"
         return "naive" if requested == "naive" else "hybrid_radix"
     return requested
 
@@ -1591,6 +1777,25 @@ def _adjust_config(config: EngineConfig):
             "and let every layer decode on the GPU offload path instead."
         )
 
+    if is_moe and config.moe_strategy == "auto" and is_mps():
+        # Metal has no PCIe hop to hide and no pinned host memory, so the offload family buys
+        # nothing here: keep the experts resident when the whole set fits the same memory_ratio
+        # cut of free memory the KV sizing uses, else fall through to offload.
+        from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
+
+        bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
+        fits = False
+        if bank_bytes:
+            budget = int(device_backend.free_memory() * config.memory_ratio)
+            fits = bank_bytes <= budget
+            logger.info_rank0(
+                f"Metal resident-expert check: banks {mem_GB(bank_bytes)} vs budget "
+                f"{mem_GB(budget)} -> {'fused' if fits else 'offload'}"
+            )
+        if fits:
+            override("moe_strategy", "fused")
+            logger.info_rank0("Auto-selected MoE strategy: fused (Metal, experts fit resident)")
+
     if is_moe and config.moe_strategy == "auto":
         # A MoE model always defaults to the offload family: experts stream from pinned host
         # banks into an auto-sized GPU slot cache, which is the only default that serves a model
@@ -1731,9 +1936,12 @@ def _adjust_config(config: EngineConfig):
             f"two-layer prefill buffer (moe_cache_size={2 * num_experts})"
         )
 
+    # Resident (non-offload) expert formats: the ones MoELayer can allocate and _resident_gemm
+    # has a kernel for. nvfp4 is resident on Metal only, not on CUDA.
+    _resident_formats = ("none", "fp8_block") + (("nvfp4",) if is_mps() else ())
     if (
         is_moe
-        and expert_quant not in ("none", "fp8_block")
+        and expert_quant not in _resident_formats
         and not is_offload_moe_strategy(config.moe_strategy)
     ):
         raise ValueError(

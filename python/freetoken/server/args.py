@@ -685,6 +685,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--dense-quant-override",
+        default=ServerArgs.dense_quant_override,
+        choices=["none", "fp8"],
+        help=(
+            "Metal only: quantize the dense weights the checkpoint left unquantized to "
+            "fp8-e4m3 with a per-output-row scale and serve them W8A16, freeing resident "
+            "memory for MoE cache slots (lossy; the checkpoint's own format wins)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cpu-threads",
         type=int,
         default=ServerArgs.moe_cpu_threads,
