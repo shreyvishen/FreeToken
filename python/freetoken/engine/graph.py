@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List
 
 import torch
+
+from freetoken.kernel import backend as device_backend
+from freetoken.kernel.backend import is_mps
 from freetoken.core import Batch, Req, get_global_ctx
 from freetoken.distributed import get_tp_info
 from freetoken.utils import init_logger, mem_GB
@@ -99,7 +102,7 @@ def _determine_cuda_graph_bs(
 
 
 def get_free_memory(device: torch.device) -> int:
-    return torch.cuda.mem_get_info(device)[0]
+    return device_backend.free_memory(device)
 
 
 class GraphRunner:
@@ -116,13 +119,26 @@ class GraphRunner:
         vocab_size: int,
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
+        max_running_req: int | None = None,
         mrope: bool = False,
     ) -> None:
-        cuda_graph_bs = _determine_cuda_graph_bs(
-            cuda_graph_bs=cuda_graph_bs,
-            cuda_graph_max_bs=cuda_graph_max_bs,
-            free_memory=free_memory,
-        )
+        # Off CUDA the sizes come from the MPS decode plan (engine/mps_tape.py) or are empty,
+        # and an empty list makes max_graph_bs 0, which sends every batch down the eager path.
+        # The MPS plan is CUDA's ladder capped at max_running_req, plus that cap itself.
+        if device_backend.is_cuda():
+            cuda_graph_bs = _determine_cuda_graph_bs(
+                cuda_graph_bs=cuda_graph_bs, cuda_graph_max_bs=cuda_graph_max_bs,
+                free_memory=free_memory,
+            )
+        elif not is_mps():
+            cuda_graph_bs = []
+        elif cuda_graph_bs is None:
+            cap = max_running_req or 1
+            if cuda_graph_max_bs is not None:
+                cap = min(cap, cuda_graph_max_bs)
+            cuda_graph_bs = sorted(
+                {bs for bs in [1, 2, 4] + list(range(8, cap + 1, 8)) if bs <= cap} | {cap}
+            ) if cap >= 1 else []
         self.attn_backend = attn_backend
         self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0
         self.graph_bs_list = sorted(cuda_graph_bs)
@@ -150,9 +166,9 @@ class GraphRunner:
 
         self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list)
 
-        torch.cuda.synchronize(self.device)
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(self.device)
+        device_backend.synchronize(self.device)
+        device_backend.empty_cache()
+        device_backend.reset_peak_memory_stats(self.device)
 
         logger.info_rank0(f"Start capturing CUDA graphs with sizes: {self.graph_bs_list}")
         free_memory = get_free_memory(self.device)
@@ -174,7 +190,6 @@ class GraphRunner:
             free_memory = get_free_memory(self.device)
             pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
             pbar.refresh()
-            graph = torch.cuda.CUDAGraph()
             batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
             batch.padded_reqs = batch.reqs
             self.attn_backend.prepare_for_capture(batch)
@@ -186,6 +201,24 @@ class GraphRunner:
                           if self.dummy_req.linear_slot_idx is not None
                           else self.dummy_req.table_idx)
             self.buffer.table_idx[:bs].fill_(dummy_slot)
+            if not device_backend.is_cuda():
+                # MPS: record this decode forward as a tape in place of a CUDA graph.
+                from freetoken.engine.mps_tape import DecodeTape, TapeUnsupported
+
+                logits = self.buffer.logits
+                with get_global_ctx().forward_batch(batch):
+                    logits[:bs] = model.forward()  # warm: shaders compiled, buffers sized
+                    try:
+                        tape = DecodeTape.record(lambda: logits[:bs].copy_(model.forward()))
+                    except TapeUnsupported as e:
+                        logger.warning(f"decode plan: bs={bs} stays on the eager loop ({e})")
+                        self.graph_bs_list.remove(bs)
+                        self.max_graph_bs = max(self.graph_bs_list) if self.graph_bs_list else 0
+                        continue
+                self.graph_map[bs] = tape
+                logger.info_rank0(f"decode plan: bs={bs} recorded as {len(tape)} launches")
+                continue
+            graph = torch.cuda.CUDAGraph()
             with get_global_ctx().forward_batch(batch):
                 self.buffer.logits[:bs] = model.forward()
                 # Keep the offload cache warmed for capture. Resetting here forces

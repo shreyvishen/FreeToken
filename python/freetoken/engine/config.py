@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.distributed import DistributedInfo
+from freetoken.kernel.backend import is_mps
 from freetoken.layers.quantization import set_quant_config
 from freetoken.mm.config import ENCODER_SECTIONS, MultimodalConfig
 from freetoken.models.register import EncoderSpec, ModelSpec, _load_attr, checkpoint_quant_config, get_model_spec
@@ -41,7 +42,14 @@ class EngineConfig:
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
+    # Unified memory only: ceiling on the KV tokens the one-pool plan may take, so the leftover
+    # budget stays host memory instead of KV no request can address. 0 = uncapped, CUDA ignores.
+    kv_cap_tokens: int | None = 65536
     moe_cache_policy: str = "lru"
+    # Metal only (--dense-quant-override): quantize the dense weights the checkpoint left
+    # unquantized to fp8-e4m3 + a per-row scale and serve them W8A16, freeing resident memory
+    # for MoE slots. Lossy, hence "none" by default; the checkpoint's own format always wins.
+    dense_quant_override: str = "none"
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
     # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8
@@ -93,6 +101,14 @@ class EngineConfig:
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
+        # The loader re-runs ``parse_config`` in whichever process reads the checkpoint, so the
+        # override travels in the environment (models/config.set_dense_quant_override) and every
+        # construction path goes through here.
+        from freetoken.models.config import dense_quant_override, set_dense_quant_override
+
+        if self.dense_quant_override == "none":
+            object.__setattr__(self, "dense_quant_override", dense_quant_override())
+        set_dense_quant_override(self.dense_quant_override)
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":
@@ -112,6 +128,8 @@ class EngineConfig:
     @cached_property
     def active_encoders(self) -> tuple[EncoderSpec, ...]:
         """The encoder towers this process builds: the family registers them, the checkpoint config carries their section, --mm-disable did not name them."""
+        if is_mps():
+            return ()  # the towers stream their weights over CUDA streams; Metal serves text only
         return tuple(
             e
             for e in self.model_spec.encoders
@@ -136,6 +154,12 @@ class EngineConfig:
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
+        from freetoken.layers.quantization import dense_fp8_override
+
+        # --dense-quant-override needs the parsed model to know which dense layers exist, so the
+        # override lands after parse_config and the final QuantConfig is republished.
+        quant = dense_fp8_override(quant, model_config)
+        set_quant_config(quant)
         return replace(model_config, quant=quant)
 
     @property

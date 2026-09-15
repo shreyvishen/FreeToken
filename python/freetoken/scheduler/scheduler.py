@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import contextlib
 import os
+import resource
+import subprocess
 
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
+
+from freetoken.kernel import backend as device_backend
 from freetoken.attention.linear import build_fla_metadata
 from freetoken.core import Batch, Req
 from freetoken.env import ENV
@@ -43,6 +48,14 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Print every sampled token id as the scheduler appends it.
+_LOG_TOKEN_IDS = os.getenv("FREETOKEN_LOG_TOKEN_IDS", "0") != "0"
+
+# Log MPS allocator and host memory every N decode steps; 0 = off.
+_LOG_MPS_MEM = int(os.getenv("FREETOKEN_LOG_MPS_MEM", "0") or 0)
+# Steps between the MPS device-wide drains below.
+_MPS_SYNC_EVERY = 64
+
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
 
@@ -69,11 +82,13 @@ class Scheduler(SchedulerIOMixin):
 
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device
-        self.stream = torch.cuda.Stream(device=self.device)
-        self.engine_stream_ctx = torch.cuda.stream(self.engine.stream)
-        torch.cuda.set_stream(self.stream)
+        self.stream = device_backend.Stream(device=self.device)
+        # reusable, unlike a @contextmanager: re-entered every loop iteration
+        self.engine_stream_ctx = (contextlib.nullcontext() if device_backend.is_mps()
+                                  else torch.cuda.stream(self.engine.stream))
+        device_backend.set_stream(self.stream)
         # sent on the readiness ack for /v1/stats gpus; a list so TP can add one entry per rank
-        self.gpus = [gpu_identity(self.device.index)] if self.device.type == "cuda" else []
+        self.gpus = [gpu_identity(self.device.index)] if self.device.type != "cpu" else []
 
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
@@ -120,6 +135,8 @@ class Scheduler(SchedulerIOMixin):
         # A received-but-not-yet-executed runtime cache rebuild (CacheRebuildBackendMsg),
         # run at the next idle safe point in overlap_loop. None when no rebuild is pending.
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
+        self._mps_mem_step = 0
+        self._mps_sync_step = 0
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
@@ -173,7 +190,7 @@ class Scheduler(SchedulerIOMixin):
         """
         assert not self.prefill_manager.runnable, "rebuild requires no pending prefill"
         assert not self.decode_manager.runnable, "rebuild requires no running decode"
-        torch.cuda.synchronize(self.device)
+        device_backend.synchronize(self.device)
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
         self.engine.rebuild_runtime_cache(
@@ -215,6 +232,10 @@ class Scheduler(SchedulerIOMixin):
         # before the message loop is what makes the check airtight: the batch launched later
         # this iteration can only be probed by messages of the NEXT iteration, which sees it here.
         self._last_data = last_data
+        # Close the previous iteration's staged H2D generation before this one queues
+        # anything: _process_last_data below waits on that iteration's copy_done, which is
+        # exactly the point those copies are proven landed.
+        device_backend.mark_h2d_generation()
         blocking = not (
             last_data is not None  # don't block if we have a batch to be processed
             or self.prefill_manager.runnable
@@ -261,6 +282,7 @@ class Scheduler(SchedulerIOMixin):
         return ongoing_data
 
     def normal_loop(self) -> None:
+        device_backend.mark_h2d_generation()
         blocking = not (
             self.prefill_manager.runnable
             or self.decode_manager.runnable
@@ -299,13 +321,13 @@ class Scheduler(SchedulerIOMixin):
                 while True:
                     self.normal_loop()
         else:
-            assert torch.cuda.current_stream() == self.stream
+            assert device_backend.current_stream() == self.stream
             data = None
             while True:
                 data = self.overlap_loop(data)
 
     def shutdown(self) -> None:
-        torch.cuda.synchronize(self.device)
+        device_backend.synchronize(self.device)
         self.sync_all_ranks()
         self.engine.shutdown()
 
@@ -315,6 +337,9 @@ class Scheduler(SchedulerIOMixin):
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
+        # Every H2D staged by backend.stage_h2d was queued before this event was recorded,
+        # so waiting on it proves those copies landed and their host sources can go.
+        device_backend.release_h2d_staging()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
@@ -345,6 +370,8 @@ class Scheduler(SchedulerIOMixin):
                     # client's terminal reply.
                     continue
                 next_token = next_tokens_cpu[i]
+                if _LOG_TOKEN_IDS:
+                    logger.info_rank0(f"sampled token id: {int(next_token)}")
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
@@ -482,8 +509,10 @@ class Scheduler(SchedulerIOMixin):
     def _gpu_mem_bytes(self) -> int:
         """Bytes this engine process holds on the GPU (torch's reserved caching-allocator
         pool: weights + KV + MoE cache + graphs). 0 on CPU. Cheap, no device sync."""
-        if self.device.type != "cuda":
+        if self.device.type == "cpu":
             return 0
+        if device_backend.is_mps():
+            return torch.mps.driver_allocated_memory()
         return torch.cuda.memory_reserved(self.device)
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
@@ -831,9 +860,12 @@ class Scheduler(SchedulerIOMixin):
                     pool = self.engine.linear_state_pool
                     slots = [r.linear_slot_idx if r.linear_slot_idx is not None
                              else pool.padding_slot for r in batch.padded_reqs]
-                    batch.linear_table_idx = torch.tensor(
-                        slots, dtype=torch.int32, device="cpu", pin_memory=True
-                    ).to(self.device, non_blocking=True)
+                    slots_host = torch.tensor(
+                        slots, dtype=torch.int32, device="cpu", pin_memory=device_backend.PIN_MEMORY
+                    )
+                    batch.linear_table_idx = slots_host.to(
+                        self.device, non_blocking=device_backend.stage_h2d(slots_host)
+                    )
                 else:
                     batch.linear_table_idx = input_mapping[0].to(torch.int32)
             # Per-forward GDN metadata (cu_seqlens / cache_indices / continuation flags),
@@ -858,8 +890,14 @@ class Scheduler(SchedulerIOMixin):
         if plan:
             batch.mm_encoder_jobs = jobs
             batch.mm_gather_plan = plan
-            batch.mm_rows = torch.tensor(rows, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
-            batch.mm_block_ends = torch.tensor(block_ends, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+            rows_host = torch.tensor(rows, dtype=torch.int64, pin_memory=device_backend.PIN_MEMORY)
+            ends_host = torch.tensor(block_ends, dtype=torch.int32, pin_memory=device_backend.PIN_MEMORY)
+            batch.mm_rows = rows_host.to(
+                self.device, non_blocking=device_backend.stage_h2d(rows_host)
+            )
+            batch.mm_block_ends = ends_host.to(
+                self.device, non_blocking=device_backend.stage_h2d(ends_host)
+            )
         if self._bidirectional_mm and not self._warned_cut_image and (cut := cut_image_spans(batch.padded_reqs)):
             # only a bidirectional image span loses context when cut, and only an image longer than the chunk still gets cut
             lo, hi = cut[0]
@@ -903,8 +941,33 @@ class Scheduler(SchedulerIOMixin):
         pending.clear()
         self.send_result([ErrorReplyMsg(uid=uid, error="request aborted") for uid in uids])
 
+    def _log_mps_mem(self, batch: Batch) -> None:
+        """One line per `_LOG_MPS_MEM` decode steps: `driver` growing while `current` stays
+        flat is the caching allocator holding one buffer per distinct size, not a leak."""
+        self._mps_mem_step += 1
+        if self._mps_mem_step % _LOG_MPS_MEM:
+            return
+        kv_len = max((r.device_len for r in batch.reqs), default=0)
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        swap = subprocess.run(
+            ["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True
+        ).stdout.strip()
+        logger.info(
+            "mps-mem step=%d kv_len=%d driver=%s current=%s rss_max=%s swap=[%s]",
+            self._mps_mem_step, kv_len, _gib(torch.mps.driver_allocated_memory()),
+            _gib(torch.mps.current_allocated_memory()), _gib(rss), swap,
+        )
+
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
+        # The host runs ahead of the GPU, so a buffer the MPS caching allocator freed is still
+        # owned by queued work and the next step gets a fresh block instead.
+        if _MPS_SYNC_EVERY and self.device.type == "mps":
+            self._mps_sync_step += 1
+            if self._mps_sync_step % _MPS_SYNC_EVERY == 0:
+                torch.mps.synchronize()
+        if _LOG_MPS_MEM and not batch.is_prefill and self.device.type == "mps":
+            self._log_mps_mem(batch)
         batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
@@ -917,7 +980,7 @@ class Scheduler(SchedulerIOMixin):
 def _make_mrope_positions(batch: Batch, device: torch.device) -> torch.Tensor:
     """[3, N] rope rows: an image request's prompt tokens use their precomputed columns, everything else is sequence index + per-request delta."""
     needed = sum(r.extend_len for r in batch.padded_reqs)
-    host = torch.empty((3, needed), dtype=torch.int32, pin_memory=True)
+    host = torch.empty((3, needed), dtype=torch.int32, pin_memory=device_backend.PIN_MEMORY)
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
@@ -933,12 +996,12 @@ def _make_mrope_positions(batch: Batch, device: torch.device) -> torch.Tensor:
             )
             out.copy_(row.unsqueeze(0).expand(3, -1))
         offset += length
-    return host.to(device, non_blocking=True)
+    return host.to(device, non_blocking=device_backend.stage_h2d(host))
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
     needed_size = sum(r.extend_len for r in batch.padded_reqs)
-    indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
+    indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=device_backend.PIN_MEMORY)
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
@@ -949,22 +1012,32 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
             out=indices_host[offset : offset + length],
         )
         offset += length
-    return indices_host.to(device, non_blocking=True)
+    return indices_host.to(device, non_blocking=device_backend.stage_h2d(indices_host))
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
+    mapping_host = torch.empty(
+        len(batch.positions), dtype=torch.int64, pin_memory=device_backend.PIN_MEMORY
+    )
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
         mapping_host[offset : offset + length].fill_(req.table_idx)
         offset += length
-    return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
+    return (
+        mapping_host.to(device, non_blocking=device_backend.stage_h2d(mapping_host)),
+        batch.positions.to(torch.int64),
+    )
 
 
 def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
     mapping_list = [req.table_idx for req in batch.reqs]
-    mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
+    mapping_host = torch.tensor(
+        mapping_list, dtype=torch.int64, pin_memory=device_backend.PIN_MEMORY
+    )
     write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
-    write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
-    return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)
+    write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=device_backend.PIN_MEMORY)
+    return (
+        mapping_host.to(device, non_blocking=device_backend.stage_h2d(mapping_host)),
+        write_host.to(device, non_blocking=device_backend.stage_h2d(write_host)),
+    )
