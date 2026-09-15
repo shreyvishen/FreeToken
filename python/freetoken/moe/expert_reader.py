@@ -3,10 +3,13 @@ byte buffers, from either on-disk layout."""
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import re
+import struct
+import sys
 import threading
 from dataclasses import dataclass
 
@@ -18,6 +21,11 @@ logger = init_logger(__name__)
 
 # Alignment the repack pads its records to, and the alignment direct I/O needs.
 _PAGE = 4096
+
+# F_RDADVISE (Darwin <sys/fcntl.h>, line 251): start an async read of a byte range with no copy
+# to user. Python's fcntl module does not export it. Its argument is a struct radvisory
+# {off_t ra_offset; int ra_count}.
+_F_RDADVISE = 44
 
 _KEY_RE = re.compile(
     r"model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
@@ -178,6 +186,7 @@ class ExpertReader:
         self._fd_lock = threading.Lock()
         self._entries: dict[tuple[int, int], tuple[int, int]] | None = None
         self._index: Nvfp4DiskIndex | None = None
+        self._hint = sys.platform == "darwin"
         if repacked_dir and os.path.isdir(repacked_dir):
             with open(os.path.join(repacked_dir, "experts.index.json"), encoding="utf-8") as f:
                 meta = json.load(f)
@@ -214,12 +223,32 @@ class ExpertReader:
                 fd = self._fds.get(path)
                 if fd is None:
                     fd = os.open(path, os.O_RDONLY)
+                    # Paired with the F_RDADVISE hints: drop this call to measure them against
+                    # a warm page cache instead.
                     set_nocache_fd(fd)
                     self._fds[path] = fd
         return fd
 
+    def hint(self, layer: int, expert: int) -> None:
+        """Ask the drive to start fetching this expert's bytes now. Best-effort: the first
+        ``OSError`` (EINVAL on some descriptors) turns the hint off for this reader."""
+        if not self._hint:
+            return
+        try:
+            if self._entries is None:
+                for piece in self._index.get(layer, expert).all_locs():
+                    fcntl.fcntl(self._fd(piece.shard_path), _F_RDADVISE,
+                                struct.pack("qi", piece.offset, piece.nbytes))
+            else:
+                offset, size = self._entries[(layer, expert)]
+                fcntl.fcntl(self._bin_fd, _F_RDADVISE, struct.pack("qi", offset, size))
+        except OSError as err:
+            self._hint = False
+            logger.warning(f"MoE disk tier: readahead hint refused ({err}); hints off")
+
     def read_into(self, layer: int, expert: int, dests: list[memoryview]) -> None:
         """Fill ``dests``, nine writable byte views in :data:`PIECE_ORDER`."""
+        self.hint(layer, expert)
         if self._entries is None:
             loc = self._index.get(layer, expert)
             for name, dest in zip(PIECE_ORDER, dests):

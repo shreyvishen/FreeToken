@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import struct
+import sys
 
+import pytest
 import safetensors.torch
 import torch
 
 from freetoken.moe.disk_cache import PIN_RANK_TOKENS, DiskMoeCache
-from freetoken.moe.expert_reader import PIECE_ORDER, ExpertReader, Nvfp4DiskIndex
+from freetoken.moe.expert_reader import _F_RDADVISE, PIECE_ORDER, ExpertReader, Nvfp4DiskIndex
 
 GROUP, FP8 = 16, torch.float8_e4m3fn
 NUM_EXPERTS, HIDDEN, INTER, LAYER = 2, 32, 16, 0
@@ -90,6 +94,39 @@ def test_repacked_reader_matches_the_index_reader(tmp_path):
         assert bytes(xa) == bytes(xb), name
     index_reader.close()
     repacked_reader.close()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="F_RDADVISE is a Darwin fcntl")
+def test_the_readahead_hint_names_the_bytes_the_read_returns(tmp_path, monkeypatch):
+    model_path, _ = write_tiny_checkpoint(tmp_path)
+    locs = Nvfp4DiskIndex(model_path).get(LAYER, 1).all_locs()
+    hinted, real = [], fcntl.fcntl
+
+    def record(fd, cmd, arg=0):
+        if cmd == _F_RDADVISE:
+            hinted.append(struct.unpack("qi", arg))
+        return real(fd, cmd, arg)
+
+    monkeypatch.setattr(fcntl, "fcntl", record)
+    reader = ExpertReader(model_path)
+    dests = [bytearray(loc.nbytes) for loc in locs]
+    reader.read_into(LAYER, 1, [memoryview(d) for d in dests])
+    assert hinted == [(loc.offset, loc.nbytes) for loc in locs]
+    for loc, got in zip(locs, dests):
+        assert bytes(got) == loc.read().tobytes()
+    reader.close()
+
+    # The repack path hints the one record it is about to read.
+    from freetoken.checkpoint.repack_nvfp4_experts import build as repack_build
+
+    repacked_dir = str(tmp_path / "repacked")
+    repack_build(model_path, repacked_dir, layers=[LAYER])
+    reader = ExpertReader(model_path, repacked_dir)
+    hinted.clear()
+    reader.read_into(LAYER, 1, [memoryview(bytearray(loc.nbytes)) for loc in locs])
+    assert hinted == [reader._entries[(LAYER, 1)]]
+    assert hinted[0][1] >= sum(loc.nbytes for loc in locs)  # the record holds all nine
+    reader.close()
 
 
 def test_the_pin_set_holds_the_routing_head_against_eviction(tmp_path):

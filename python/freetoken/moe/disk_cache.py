@@ -305,6 +305,8 @@ class DiskMoeCache(OffloadMoeCache):
             rank[j] = _NEVER
             slots[expert] = victim
             pending.append((int(expert), victim))
+            # Start the drive now, while the host still has this step's routing to finish.
+            self.reader.hint(layer_id, int(expert))
         self.n_misses += len(pending)
 
         self._pending = pending
