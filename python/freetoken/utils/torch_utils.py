@@ -21,7 +21,9 @@ def torch_dtype(dtype: torch.dtype):
 
 
 def nvtx_annotate(name: str, layer_id_field: str | None = None):
-    import torch.cuda.nvtx as nvtx
+    # through the device seam: torch.cuda.nvtx raises on a non-CUDA build, and this
+    # decorator wraps ops that run on Metal too (embedding, sampler, MoE).
+    from freetoken.kernel.backend import nvtx_range
 
     def decorator(fn):
         @functools.wraps(fn)
@@ -29,7 +31,7 @@ def nvtx_annotate(name: str, layer_id_field: str | None = None):
             display_name = name
             if layer_id_field and hasattr(self, layer_id_field):
                 display_name = name.format(getattr(self, layer_id_field))
-            with nvtx.range(display_name):
+            with nvtx_range(display_name):
                 return fn(self, *args, **kwargs)
 
         return wrapper

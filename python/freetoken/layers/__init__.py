@@ -3,6 +3,7 @@ from .activation import (
     gated_act_and_mul,
     gelu_and_mul,
     gelu_tanh_and_mul,
+    sigmoid_gate_mul,
     silu_and_mul,
     swiglu_clamp_and_mul,
     swigluoai_and_mul,
@@ -29,6 +30,7 @@ from .norm import (
 from .rotary import get_rope, set_rope_device
 
 __all__ = [
+    "sigmoid_gate_mul",
     "silu_and_mul",
     "gelu_and_mul",
     "gelu_tanh_and_mul",

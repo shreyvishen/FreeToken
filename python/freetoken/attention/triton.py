@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import accumulate
 from typing import TYPE_CHECKING, List
 
 import torch
+
+from freetoken.kernel import backend as device_backend
 from freetoken.core import Batch, get_global_ctx
 
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
@@ -11,6 +14,14 @@ from .utils import BaseCaptureData
 
 if TYPE_CHECKING:
     from freetoken.models import ModelConfig
+
+
+def _int32_on(values: list[int], device: torch.device) -> torch.Tensor:
+    """``torch.tensor(values, int32)`` on ``device``."""
+    if device.type != "mps":
+        return torch.tensor(values, dtype=torch.int32, device=device)
+    host = torch.tensor(values, dtype=torch.int32)
+    return host.to(device, non_blocking=device_backend.stage_h2d(host))
 
 
 @dataclass
@@ -74,18 +85,27 @@ class TritonMetadata(BaseAttnMetadata):
     attn_lse: torch.Tensor | None = None
     num_kv_splits: torch.Tensor | None = None
     swa_indices: torch.Tensor | None = None
+    # Host copies of `indptr` / `cu_seqlens_q_gpu`, filled only when the backend asks for them
+    # (`needs_host_indptr`).
+    indptr_host: List[int] | None = None
+    cu_seqlens_q_host: List[int] | None = None
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q_gpu[1 : 1 + bs] - 1
 
 
 class TritonAttentionBackend(BaseAttnBackend):
+    # Subclasses whose kernel iterates requests on the host set this, and
+    # `prepare_metadata` publishes the indptrs it already has as Python lists.
+    needs_host_indptr = False
+
     def __init__(self, config: ModelConfig):
         self.config = config
         self.kvcache = get_global_ctx().kv_cache
         self.device = self.kvcache.device
         self.capture: TritonCaptureData | None = None
         self.capture_bs: List[int] = []
+        self._indices_buf: torch.Tensor | None = None  # MPS: see prepare_metadata
         self.max_graph_bs = 0
         self.max_kv_splits = 8
         self.prefill_tile_min_q = 128
@@ -230,18 +250,31 @@ class TritonAttentionBackend(BaseAttnBackend):
         cached_lens = [req.cached_len for req in reqs]
         num_query_tokens = sum(seqlens_q)
         is_decode = max(seqlens_q) == 1
-        prefix_lens = torch.tensor(cached_lens, dtype=torch.int32, device=device)
+        prefix_lens = _int32_on(cached_lens, device)
 
-        indptr = torch.tensor([0] + seqlens_k, dtype=torch.int32, device=device).cumsum_(0)
+        indptr = _int32_on([0] + seqlens_k, device).cumsum_(0)
         if is_decode:
             cu_seqlens_q_gpu = torch.arange(0, padded_size + 1, device=device, dtype=torch.int32)
         elif all(l == 0 for l in cached_lens):
             cu_seqlens_q_gpu = indptr
         else:
-            cu_seqlens_q_gpu = torch.tensor(
-                [0] + seqlens_q, dtype=torch.int32, device=device
-            ).cumsum_(0)
-        indices = torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs])
+            cu_seqlens_q_gpu = _int32_on([0] + seqlens_q, device).cumsum_(0)
+        if page_table.device.type != "mps":
+            indices = torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs])
+        else:
+            # MPS keeps a driver buffer per distinct size, so a kv_len-sized cat leaks one per
+            # step; a grown power-of-two buffer does not.
+            total = sum(seqlens_k)
+            if self._indices_buf is None or self._indices_buf.numel() < total:
+                self._indices_buf = torch.empty(
+                    1 << max(total - 1, 0).bit_length(), dtype=page_table.dtype,
+                    device=page_table.device,
+                )
+            indices = self._indices_buf[:total]
+            offset = 0
+            for req, length in zip(reqs, seqlens_k):
+                indices[offset : offset + length].copy_(page_table[req.table_idx, :length])
+                offset += length
         swa_indices = None
         if getattr(self.kvcache, "swa_paged", False):
             # Global-paged SWA (naive + radix): the swa-layer gather reads swa-pool slots = full->swa
@@ -260,6 +293,15 @@ class TritonAttentionBackend(BaseAttnBackend):
         if q_positions is None:
             q_positions = torch.zeros(num_query_tokens, dtype=torch.int64, device=device)
 
+        indptr_host = cu_seqlens_q_host = None
+        if self.needs_host_indptr:
+            indptr_host = list(accumulate(seqlens_k, initial=0))
+            # mirrors the cu_seqlens_q_gpu branch above: decode pads to one token per request
+            cu_seqlens_q_host = (
+                list(range(padded_size + 1)) if is_decode
+                else list(accumulate(seqlens_q, initial=0))
+            )
+
         batch.attn_metadata = TritonMetadata(
             cu_seqlens_q_gpu=cu_seqlens_q_gpu,
             indptr=indptr,
@@ -270,6 +312,8 @@ class TritonAttentionBackend(BaseAttnBackend):
             prefix_lens=prefix_lens,
             max_q_len=max(seqlens_q),
             swa_indices=swa_indices,
+            indptr_host=indptr_host,
+            cu_seqlens_q_host=cu_seqlens_q_host,
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:

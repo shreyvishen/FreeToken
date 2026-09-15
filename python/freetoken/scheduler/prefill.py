@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 from freetoken.core import Batch, Req
+from freetoken.kernel import backend as device_backend
 from freetoken.utils import align_down, div_ceil, init_logger
 
 from .mm import mm_chunk_end, mm_rows_after
@@ -113,7 +114,8 @@ class PrefillAdder:
         table_idx = self.table_manager.allocate()
         if cached_len > 0:  # NOTE: set the cached part
             device_ids = self.table_manager.token_pool[table_idx][:cached_len]
-            device_ids.copy_(_maybe_pinned(req.input_ids[:cached_len]), non_blocking=True)
+            host_ids = _maybe_pinned(req.input_ids[:cached_len])
+            device_ids.copy_(host_ids, non_blocking=device_backend.stage_h2d(host_ids))
             # Write the matched indices into the TAIL of the page_entry: a cache may return
             # fewer matched indices than cached_len, in which case only the trailing n slots are
             # known-live. Today both the generic radix and the SWA radix match a prefix whose
@@ -205,7 +207,8 @@ class PrefillAdder:
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
-        device_ids.copy_(_maybe_pinned(pending_req.input_ids[_slice]), non_blocking=True)
+        host_ids = _maybe_pinned(pending_req.input_ids[_slice])
+        device_ids.copy_(host_ids, non_blocking=device_backend.stage_h2d(host_ids))
         req = CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             table_idx=table_idx,

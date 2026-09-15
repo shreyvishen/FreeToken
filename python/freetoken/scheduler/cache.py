@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Tuple
 
 import torch
+from freetoken.kernel import backend as device_backend
 from freetoken.core import Req
 from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
 from freetoken.utils import align_down, div_ceil
@@ -637,8 +638,12 @@ def _write_page_table(
         torch.arange(first_pos, last_pos, out=positions_host[offset : offset + length])
         offset += length
     assert offset == needed_tokens, "Mismatch in allocated tokens and filled tokens."
-    table_idxs = table_idx_host.to(page_table.device, non_blocking=True)
-    offsets = positions_host.to(page_table.device, non_blocking=True)
+    table_idxs = table_idx_host.to(
+        page_table.device, non_blocking=device_backend.stage_h2d(table_idx_host)
+    )
+    offsets = positions_host.to(
+        page_table.device, non_blocking=device_backend.stage_h2d(positions_host)
+    )
     assert allocated.dtype == page_table.dtype, (
         f"allocated dtype {allocated.dtype} != page_table dtype {page_table.dtype}"
     )

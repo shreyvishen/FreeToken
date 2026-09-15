@@ -13,10 +13,24 @@ addressed by page tables, and sparse attention is a physical-slot gather (see
 :mod:`freetoken.attention.dsv4_sparse` and :mod:`freetoken.kvcache.dsv4_paged_pool`).
 """
 
+import importlib
+
 from .args import DeepseekV4Args, load_args
 from .config import parse_config
-from .model import DeepseekV4ForCausalLM
 from .weight import iter_expert_pieces, iter_weights
+
+# The model module reaches the DSV4 Triton kernels at import time, and triton is Linux-only
+# (pyproject).
+_LAZY = {"DeepseekV4ForCausalLM": ".model"}
+
+
+def __getattr__(name: str):
+    if name not in _LAZY:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(importlib.import_module(_LAZY[name], __name__), name)
+    globals()[name] = value
+    return value
+
 
 __all__ = [
     "DeepseekV4Args",

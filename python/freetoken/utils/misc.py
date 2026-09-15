@@ -1,5 +1,18 @@
 from __future__ import annotations
 
+import sys
+
+# F_NOCACHE (fcntl.h), Darwin's nearest to O_DIRECT: keep this fd's reads out of the buffer cache.
+_F_NOCACHE = 48
+
+
+def set_nocache_fd(fd: int) -> None:
+    """Exempt ``fd`` from the OS page cache on Darwin (fcntl raises on failure); no-op elsewhere."""
+    if sys.platform == "darwin":
+        import fcntl
+
+        fcntl.fcntl(fd, _F_NOCACHE, 1)
+
 
 def call_if_main(name: str = "__main__", discard: bool | None = None):
     """Decorator to ensure a function will call when the script is run as main."""

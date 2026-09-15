@@ -10,6 +10,7 @@ from einops import rearrange
 from freetoken.kernel.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from freetoken.kernel.fla.chunk_fwd import chunk_gated_delta_rule_fwd_intra
 from freetoken.kernel.fla.chunk_o import chunk_fwd_o
+from freetoken.kernel.fla.const import CHUNK_SIZE
 from freetoken.kernel.fla.cumsum import chunk_local_cumsum
 from freetoken.kernel.fla.index import (
     prepare_chunk_indices,
@@ -22,10 +23,8 @@ from freetoken.kernel.fla.utils import (
 )
 
 # NOTE: upstream sglang has an `if is_intel:` branch here that swaps in XPU
-# kernels from sglang.srt.hardware_backend. Stripped on vendoring — FreeToken
-# targets NVIDIA only and we don't carry the sglang hardware_backend package.
-
-CHUNK_SIZE = 64
+# kernels from sglang.srt.hardware_backend. Stripped on vendoring - FreeToken
+# has no XPU path and we don't carry the sglang hardware_backend package.
 
 
 def chunk_gated_delta_rule_fwd(

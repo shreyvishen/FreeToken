@@ -3,7 +3,12 @@
 # own, and a mismatch links the C++ extensions against the wrong libtorch.
 # setuptools floor: 77 is the first release that understands the PEP 639 `license`
 # SPDX string and `license-files` below.
-requires = ["setuptools>=77", "torch>=2.11,<2.12", "wheel"]
+requires = [
+    "setuptools>=77",
+    "torch>=2.11,<2.12; platform_system != 'Darwin'",
+    "torch>=2.10,<2.12; platform_system == 'Darwin'",
+    "wheel",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -22,6 +27,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
     "Environment :: GPU :: NVIDIA CUDA",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -38,7 +44,7 @@ dependencies = [
     "einops>=0.8,<1",
     "fastapi>=0.115,<1",
     # slot_cache: the device-side LRU admission kernel behind the MoE expert cache.
-    "flashlib==0.3.0", # pin it
+    "flashlib==0.3.0; platform_system != 'Darwin'", # pin it
     "gguf>=0.19,<1",
     "huggingface_hub>=1.5,<2",
     "msgpack>=1.1,<2",
@@ -55,8 +61,12 @@ dependencies = [
     # floor+ceiling: sglang-kernel 0.4.5 links libtorch symbols only 2.11 has.
     # PyPI's torch 2.11.0 wheel is itself the cu130 build, so plain pip resolves
     # correctly from PyPI alone; uv additionally pins the index below.
-    "torch>=2.11,<2.12",
-    "torchvision>=0.26,<0.27",
+    "torch>=2.11,<2.12; platform_system != 'Darwin'",
+    # Darwin has no sglang-kernel to link against, and 2.10 is the release the
+    # Metal path (torch.mps.compile_shader) is verified on.
+    "torch>=2.10,<2.12; platform_system == 'Darwin'",
+    "torchvision>=0.26,<0.27; platform_system != 'Darwin'",
+    "torchvision>=0.25,<0.27; platform_system == 'Darwin'",  # the release paired with torch 2.10
     "tqdm>=4.66,<5",
     "transformers>=5.16,<5.17",
     "triton==3.6.0; platform_system == 'Linux'",
@@ -90,9 +100,10 @@ accel = ["freetoken[fi,sgl]"]
 # works: PyPI's torch 2.11.0 is the same cu130 build this index serves.
 # `explicit = true` scopes the index to the one package that needs it
 # (the torch index also mirrors stale copies of common deps, e.g. packaging<=24.1,
-# which would otherwise shadow PyPI under uv's first-index strategy).
+# which would otherwise shadow PyPI under uv's first-index strategy). Darwin has no
+# cu130 wheels, so it falls through to PyPI instead.
 [tool.uv.sources]
-torch = { index = "pytorch-cu130" }
+torch = { index = "pytorch-cu130", marker = "platform_system != 'Darwin'" }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"

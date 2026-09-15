@@ -247,6 +247,13 @@ def bind_assigned_gpu(default: int = 0):
     global _assigned_visible
     import torch
 
+    from freetoken.kernel.backend import is_mps
+
+    if is_mps():
+        # One Metal device with no ordinal and nothing to bind: --gpu and
+        # CUDA_VISIBLE_DEVICES have no meaning here, so record ordinal 0 and return it.
+        _assigned_visible = 0
+        return torch.device("mps")
     if _assigned_visible is None:
         _assigned_visible = default if _assigned_physical is None else _visible_of_physical(_assigned_physical)
     if not 0 <= _assigned_visible < torch.cuda.device_count():
@@ -278,6 +285,16 @@ def gpu_identity(index: int) -> dict:
     """{index, name, uuid, total_bytes} of visible device ``index``."""
     import torch
 
+    from freetoken.kernel.backend import is_mps
+
+    if is_mps():
+        # One device, no UUID.
+        return {
+            "index": 0,
+            "name": "mps",
+            "uuid": None,
+            "total_bytes": int(torch.mps.recommended_max_memory()),
+        }
     props = torch.cuda.get_device_properties(index)
     return {
         "index": index,

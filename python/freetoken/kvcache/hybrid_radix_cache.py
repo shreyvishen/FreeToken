@@ -54,7 +54,7 @@ class EvictResult(NamedTuple):
 
 class HybridRadixCache:
     def __init__(self, device: torch.device, page_size: int) -> None:
-        from freetoken.kernel.fla.chunk import CHUNK_SIZE
+        from freetoken.kernel.fla.const import CHUNK_SIZE
         # Snapshots land on ×CHUNK_SIZE boundaries; require them to be page-aligned so the KV
         # node boundary and the GDN-state boundary coincide (page_size in {1,2,4,8,16,32,64}).
         assert CHUNK_SIZE % page_size == 0, (

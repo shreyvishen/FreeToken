@@ -22,9 +22,15 @@ def causal_conv1d_varlen(
     cu_seqlens: torch.Tensor,   # [batch+1] int32 prefix sums of per-request lengths
     cache_indices: torch.Tensor,    # [batch] int32 slot id per request
     has_initial_state: torch.Tensor,  # [batch] bool (carry conv state across chunks)
+    host: tuple | None = None,  # CPU copies of the three above (FLAMetadata); Metal only
 ) -> torch.Tensor:
     """Varlen (prefill) depthwise causal conv with silu; writes silu(conv) into ``x``
     in place and refreshes ``conv_states[cache_indices]`` with each request's tail."""
+    if x.device.type == "mps":
+        from freetoken.kernel.metal.ops import causal_conv1d_varlen as varlen_mps
+
+        return varlen_mps(x, weight, conv_states, cu_seqlens, cache_indices,
+                          has_initial_state, host)
     from freetoken.kernel.backend import is_sgl_kernel_installed
 
     if not is_sgl_kernel_installed():
@@ -56,6 +62,10 @@ def causal_conv1d_decode(
 ) -> torch.Tensor:
     """Single-token (decode) causal conv update with silu; shifts+appends the new
     token into ``conv_state[conv_state_indices]`` in place and returns silu(conv)."""
+    if x.device.type == "mps":
+        from freetoken.kernel.metal.ops import causal_conv1d_decode as decode_mps
+
+        return decode_mps(x, conv_state, weight, conv_state_indices)
     from freetoken.kernel.backend import is_sgl_kernel_installed
 
     if not is_sgl_kernel_installed():
