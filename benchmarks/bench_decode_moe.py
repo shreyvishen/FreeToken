@@ -39,6 +39,8 @@ Run (one backend):
 
 Run (all three backends, one server per backend):
     ... --model /path/to/model --backend offload,cpu,hybrid --json out.json
+
+``--backend metal`` is Darwin-only: resident experts on MPS via ``--moe-backend fused``.
 """
 
 from __future__ import annotations
@@ -77,7 +79,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--backend",
         default="offload",
-        help="comma list of offload|cpu|hybrid; one server per backend",
+        help=(
+            "comma list of offload|cpu|hybrid|metal; one server per backend. "
+            "'metal' is Darwin-only and serves --moe-backend fused (resident experts)."
+        ),
     )
     p.add_argument(
         "--aime",
@@ -174,15 +179,21 @@ def free_port() -> int:
 
 
 def serve_cmd(args: argparse.Namespace, backend: str, port: int) -> list[str]:
+    if sys.platform == "darwin" and args.gpu:
+        sys.exit("[bench] --gpu is refused on Darwin: MPS runs the one integrated GPU, there is nothing to select")
+    moe_backend = backend
+    if backend == "metal":
+        moe_backend = "fused"
     cmd = [
         sys.executable, "-m", "freetoken.cli", "serve",
         "--model", args.model,
         "--host", "127.0.0.1", "--port", str(port),
-        "--moe-backend", backend,
+        "--moe-backend", moe_backend,
         "--max-running-requests", "1",
         "--max-seq-len-override", str(8192 + args.decode),
         "--memory-ratio", str(args.mem_ratio),
-        "--cuda-graph-max-bs", "0" if args.no_graph else "1",
+        # No CUDA graphs on MPS: --no-graph is implied on Darwin regardless of the flag.
+        "--cuda-graph-max-bs", "0" if (args.no_graph or sys.platform == "darwin") else "1",
         "--moe-hybrid-max-fetch", str(args.hybrid_fetch),
     ]
     if args.gpu:
@@ -382,9 +393,11 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     backends = [b.strip() for b in args.backend.split(",") if b.strip()]
-    unknown = [b for b in backends if b not in ("offload", "cpu", "hybrid")]
+    unknown = [b for b in backends if b not in ("offload", "cpu", "hybrid", "metal")]
     if unknown:
         sys.exit(f"unknown backend(s): {unknown}")
+    if "metal" in backends and sys.platform != "darwin":
+        sys.exit("[bench] --backend metal is Darwin-only")
 
     failed = []
     for backend in backends:
