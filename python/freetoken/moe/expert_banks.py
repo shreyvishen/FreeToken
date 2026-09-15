@@ -55,6 +55,8 @@ def _dummy_fill(role: str, tensor: torch.Tensor) -> None:
     if role.endswith("_scale"):
         if tensor.dtype is torch.uint8:
             tensor.fill_(127)  # e8m0 exponent code for 1.0
+        elif tensor.dtype is torch.float8_e4m3fn:
+            tensor.view(torch.uint8).fill_(0x38)  # e4m3 code for 1.0; MPS has no fp8 fill
         else:
             tensor.fill_(1.0)
     elif role.endswith("_global"):
@@ -75,6 +77,7 @@ def build_expert_banks(
     device: torch.device,
     layer_sink=None,
     dummy: bool = False,
+    bank_device: torch.device | None = None,
 ) -> ExpertBanks:
     """Fill host banks in the kernel's layout from a stream of expert pieces.
 
@@ -91,8 +94,15 @@ def build_expert_banks(
     layout = method.layout()
     E = method.cfg.num_experts
     specs = {role: ((E, *spec.shape), spec.dtype) for role, spec in layout.items() if not spec.resident}
-    hb = alloc_layer_banks(specs, num_layers)
-    banks = {role: [b.tensor for b in hb[role]] for role in specs}
+    if bank_device is not None:
+        hb = None
+        banks = {
+            role: [torch.empty(shape, dtype=dtype, device=bank_device) for _ in range(num_layers)]
+            for role, (shape, dtype) in specs.items()
+        }
+    else:
+        hb = alloc_layer_banks(specs, num_layers)
+        banks = {role: [b.tensor for b in hb[role]] for role in specs}
     alphas = {
         role: torch.empty(num_layers * E, dtype=spec.dtype, device=device)
         for role, spec in layout.items() if spec.resident
@@ -104,7 +114,7 @@ def build_expert_banks(
                 _dummy_fill(role, tensor)
         for alpha in alphas.values():
             alpha.fill_(1.0)
-        if torch.cuda.is_available():
+        if hb is not None and torch.cuda.is_available():
             pin_banks(hb)
         return ExpertBanks(
             legacy_format_for(method.kind, kernel.name), banks,
@@ -135,8 +145,9 @@ def build_expert_banks(
             raise ValueError(f"expert banks were not filled: {len(missing)} (layer, expert) rows missing (first {missing[:4]})")
 
     if layer_sink is not None:
+        assert hb is not None, "a layer sink needs host banks"
         _fill(layer_sink)
-    elif torch.cuda.is_available():
+    elif hb is not None and torch.cuda.is_available():
         with PinPipeline() as pins:
             _fill(pins)
     else:

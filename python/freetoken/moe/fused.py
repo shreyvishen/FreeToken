@@ -39,7 +39,10 @@ def fused_topk(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
-    from freetoken.kernel.triton.moe_router import fused_topk_softmax
+    if gating_output.device.type == "mps":
+        from freetoken.kernel.metal.ops import fused_topk_softmax
+    else:
+        from freetoken.kernel.triton.moe_router import fused_topk_softmax
 
     return fused_topk_softmax(gating_output, topk, renormalize, num_token_non_padded)
 
@@ -189,6 +192,36 @@ def try_get_optimal_moe_config(
     return config
 
 
+def _torch_fused_experts(
+    hidden_states: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor, activation: str, apply_router_weight_on_input: bool,
+) -> torch.Tensor:
+    """bf16 grouped expert GEMM in plain torch, for hosts with no fused MoE kernel (Metal)."""
+    from freetoken.layers import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+
+    fn_map = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
+    if activation not in fn_map:
+        raise ValueError(f"Unsupported activation: {activation}")
+    act = fn_map[activation]
+
+    ids = topk_ids.to(torch.long)
+    out = torch.zeros_like(hidden_states)
+    for expert in ids.unique().tolist():
+        if expert < 0:  # padded row (see fused_topk_softmax): routes nowhere
+            continue
+        rows, slots = (ids == expert).nonzero(as_tuple=True)
+        x = hidden_states[rows]
+        weight = topk_weights[rows, slots].to(hidden_states.dtype).unsqueeze(-1)
+        if apply_router_weight_on_input:
+            x = x * weight
+        y = torch.nn.functional.linear(act(torch.nn.functional.linear(x, w1[expert])), w2[expert])
+        if not apply_router_weight_on_input:
+            y = y * weight
+        out.index_add_(0, rows, y.to(out.dtype))
+    hidden_states.copy_(out)
+    return hidden_states
+
+
 def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -204,6 +237,10 @@ def fused_experts_impl(
     still needs the input afterwards (a shared expert, a residual) must read it BEFORE this
     call or pass a copy. ``fused_experts_decode_impl`` allocates instead, so the contract is
     not shared; the resident bf16 path routes decode through here too."""
+    if hidden_states.device.type == "mps":
+        return _torch_fused_experts(
+            hidden_states, w1, w2, topk_weights, topk_ids, activation, apply_router_weight_on_input,
+        )
     from freetoken.kernel import fused_moe_kernel_triton, moe_sum_reduce_triton
     from freetoken.layers import gated_act_and_mul
 

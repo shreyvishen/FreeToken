@@ -6,7 +6,19 @@ from dataclasses import dataclass
 from typing import Iterator
 
 import torch
-from flashlib.kernels.slot_cache import N_STATS, Stat
+try:
+    from flashlib.kernels.slot_cache import N_STATS, Stat
+except ModuleNotFoundError:
+    # flashlib is Linux-only (pyproject): it pulls in triton, and its slot_cache is a CUDA
+    # kernel.
+    from enum import IntEnum
+
+    class Stat(IntEnum):
+        ACTIVE = 0
+        MISS = 1
+        CALLS = 2
+
+    N_STATS = len(Stat)
 
 # Fuse the per-bank expert copies into a single multi-bank launch (one per copy_missing
 # instead of one per bank). Set FREETOKEN_FUSED_COPY=0 to force the legacy per-bank path
@@ -145,9 +157,12 @@ class OffloadMoeCache:
     layout: dict | None = None
     max_slots: int | None = None
 
+    # Eviction policies this cache implements: slots are ranked by recency.
+    policies = ("lru",)
+
     def __post_init__(self) -> None:
-        policy_ids = {"lru": 0}
-        assert self.cache_policy in policy_ids
+        policy_ids = {"lru": 0, "lfu": 1}
+        assert self.cache_policy in self.policies, (self.cache_policy, self.policies)
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
         if self.layout is None:
             assert self.quant_format in _BANK_SCHEMAS, f"unknown quant_format {self.quant_format!r}"

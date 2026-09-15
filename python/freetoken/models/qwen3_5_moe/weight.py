@@ -11,7 +11,6 @@ from typing import Iterator
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
-from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
 from freetoken.layers.quantization import QuantConfig, QuantKind, QuantScheme, get_quant_config
 from freetoken.models.config import VISION_KEY_PREFIXES
 from freetoken.models.loader import ShardReader, iter_weight_files
@@ -81,7 +80,20 @@ def _per_row_scale(scale: torch.Tensor, rows: int) -> torch.Tensor:
 
 
 def _dequant_nvfp4(weight: torch.Tensor, weight_scale: torch.Tensor, weight_global: torch.Tensor) -> torch.Tensor:
-    """Packed NVFP4 -> bf16 on CUDA (the kernel is GPU-only, the converter reads on CPU), returned on the caller's device."""
+    """Packed NVFP4 -> bf16 on the GPU (the kernels are device-only, the converter reads on CPU), returned on the caller's device."""
+    from freetoken.kernel.backend import is_mps
+
+    if is_mps():
+        from freetoken.kernel.metal.nvfp4 import dequant_nvfp4_dense
+
+        dev = torch.device("mps")
+        return dequant_nvfp4_dense(
+            weight.to(dev), weight_scale.to(dev), weight_global.to(torch.float16).to(dev),
+            dtype=torch.bfloat16,
+        )
+
+    from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
+
     device = weight.device
     if device.type != "cuda":
         weight, weight_scale, weight_global = (t.to("cuda") for t in (weight, weight_scale, weight_global))
@@ -97,7 +109,10 @@ def _dequant(scheme: QuantScheme, part: dict[str, torch.Tensor]) -> torch.Tensor
     """bf16 weight of a module the checkpoint quantized but the family serves unquantized."""
     weight = part["weight"]
     if scheme.kind is QuantKind.FP8_TENSOR:
-        return (weight.to(torch.float32) * part["weight_scale"][:, None]).to(torch.bfloat16)
+        # MPS implements no float8 conversion ("does not have support for that dtype"),
+        # so the widening runs on the CPU copy and only the bf16 result crosses over.
+        wide = weight.cpu().to(torch.float32).to(weight.device) if weight.device.type == "mps" else weight.to(torch.float32)
+        return (wide * part["weight_scale"][:, None]).to(torch.bfloat16)
     if scheme.kind is QuantKind.FP8_BLOCK:
         from freetoken.kernel.triton.fp8_block_linear import dequant_block_fp8
 
@@ -160,7 +175,10 @@ class _DenseReader:
         if stored is None and tensor.dtype in _QUANT_DTYPES:
             raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} unquantized")
         if stored is not None and role == "weight" and tensor.dtype is not _ELEM_DTYPES[stored.weight.elem]:
-            raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} {stored}")
+            if not (module.endswith(".mlp.gate") and tensor.dtype is torch.bfloat16):
+                raise ValueError(f"{name} is {tensor.dtype} but the checkpoint's quant config declares {module} {stored}")
+            # modelopt exports leave the router bf16 while the config declares the layer quantized
+            stored, roles = None, {"weight": "weight"}
         target, idx, count = self.target(module)
         _, parts, expected, _ = self.pending.setdefault(target, (count, {}, {}, stored))
         parts.setdefault(idx, {})[role] = tensor
@@ -198,6 +216,15 @@ class _DenseReader:
             else:
                 value = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
             out.append((f"{target}.{role}", value))
+        served = self.scheme(target)
+        if stored is None and served is not None and served.kind is QuantKind.FP8_TENSOR:
+            # --dense-quant-override fp8: the checkpoint stored this module bf16 and the
+            # override's QuantConfig serves it W8A16, so quantize on the fused tensor the
+            # layer will hold. stored is None, so out is exactly the one weight.
+            from freetoken.kernel.metal.fp8 import quantize_fp8_per_row
+
+            weight, scale = quantize_fp8_per_row(out[0][1])
+            return [(f"{target}.weight", weight), (f"{target}.weight_scale", scale)]
         return out
 
     def _check(self, target: str, scheme: QuantScheme, part: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
