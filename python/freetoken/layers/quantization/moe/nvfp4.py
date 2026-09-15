@@ -25,13 +25,20 @@ from freetoken.utils import init_logger
 
 from ..registry import LayerKind, register_method
 from ..scheme import NVFP4_GROUP as GROUP, QuantKind
-from .base import BankSpec, ExpertView, fused_global, fused_piece, gated_epilogue_reason, global_rows, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
+from .base import BankSpec, ExpertView, fused_global, fused_piece, gated_epilogue_reason, global_rows, is_resident, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
 
 logger = init_logger(__name__)
 
 FP8 = torch.float8_e4m3fn
 MARLIN_MAX_SLOTS = 992
 B12X_MIN_INTERMEDIATE = 1024
+
+# the native bank layout, in the positional order the Metal GEMVs take it
+BANK_ROLES = ("gate_up", "gate_up_scale", "gate_up_global", "down", "down_scale", "down_global")
+
+
+def _banks(view: ExpertView) -> tuple[torch.Tensor, ...]:
+    return tuple(view.tensors[role] for role in BANK_ROLES)
 
 
 class TritonNvfp4MoEKernel(MoEKernel):
@@ -41,6 +48,9 @@ class TritonNvfp4MoEKernel(MoEKernel):
     cpu_format = "nvfp4"
 
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
+        reason = backend.triton_unusable_reason()
+        if reason:
+            return reason
         reason = self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=True, plain_silu_only=False)
         if reason:
             return reason
@@ -76,6 +86,60 @@ class TritonNvfp4MoEKernel(MoEKernel):
         if is_prefill:
             return fused_experts_nvfp4(x, *banks, topk_weights, topk_ids, view.n, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
         return fused_experts_decode_nvfp4_marlin(x, *banks, topk_weights, topk_ids, layer.activation, layer.apply_router_weight_on_input, alpha, limit)
+
+
+# Metal: the Apple-GPU GEMVs over the same checkpoint-native banks.
+
+
+class MetalNvfp4MoEKernel(TritonNvfp4MoEKernel):
+    """FreeToken's Metal expert GEMVs over the native ModelOpt rows."""
+
+    name = "metal"
+    cpu_format = None
+
+    def unusable_reason(self, cfg: MoEConfig) -> str | None:
+        if not backend.is_mps():
+            return "the Metal expert GEMVs need torch mps"
+        return self._common_reject(cfg, resident_ok=True, tp_ok=False, cpu_ok=False, plain_silu_only=True)
+
+    # -- resident: the banks are filled straight onto the device by the model's
+    # ``load_resident_experts`` hook.
+    def create_weights(self, layer) -> None:
+        layer._nvfp4_banks = None
+
+    def resident_view(self, layer) -> ExpertView:
+        banks = layer._nvfp4_banks
+        assert banks is not None, (
+            "resident NVFP4 experts were never loaded; the model needs a "
+            "load_resident_experts hook and the engine must call it"
+        )
+        return ExpertView(dict(zip(BANK_ROLES, banks)), n=layer.num_experts)
+
+    def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
+        from freetoken.kernel.metal.nvfp4 import (
+            moe_decode_nvfp4,
+            moe_prefill_nvfp4,
+            moe_prefill_nvfp4_grouped,
+        )
+
+        if not is_prefill:
+            kernel = moe_decode_nvfp4
+        elif is_resident(layer):
+            # Grouped: the routes are permuted into expert order so a weight word is loaded once
+            # and multiplied into several tokens.
+            kernel = moe_prefill_nvfp4_grouped
+        else:
+            kernel = moe_prefill_nvfp4
+        # The grouped kernels are float32 in and out; the residual stream is bf16, so
+        # prefill keeps both casts. They are one launch each and off the decode path.
+        out = kernel(x.float(), *_banks(view), topk_weights, topk_ids)
+        return out.to(x.dtype)
+
+    def apply_fused(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, base=None, shared=None):
+        """The decode kernels with the layer's neighbours folded into their epilogues."""
+        from freetoken.kernel.metal.nvfp4 import moe_decode_nvfp4
+
+        return moe_decode_nvfp4(x, *_banks(view), topk_weights, topk_ids, base=base, shared=shared)
 
 
 # ---------------------------------------------------------------------------
@@ -566,10 +630,16 @@ class B12xNvfp4MoEKernel(MoEKernel):
 
 @register_method(QuantKind.NVFP4, LayerKind.MOE)
 class Nvfp4MoEMethod(MoEMethod):
-    candidates = (TritonNvfp4MoEKernel, MarlinNvfp4MoEKernel, B12xNvfp4MoEKernel)
+    candidates = (MetalNvfp4MoEKernel, TritonNvfp4MoEKernel, MarlinNvfp4MoEKernel, B12xNvfp4MoEKernel)
 
     def create_weights(self, layer) -> None:
-        raise NotImplementedError("NVFP4 experts are served from the offload cache, not resident")
+        create = getattr(self.kernel, "create_weights", None)
+        if create is None:
+            raise NotImplementedError("NVFP4 experts are served from the offload cache, not resident")
+        create(layer)
 
     def resident_view(self, layer) -> ExpertView:
-        raise NotImplementedError("NVFP4 experts are not resident")
+        view = getattr(self.kernel, "resident_view", None)
+        if view is None:
+            raise NotImplementedError("NVFP4 experts are not resident")
+        return view(layer)

@@ -27,6 +27,7 @@ from .quant_backend import QuantBackend, get_quant_backend, set_quant_backend
 from .names import NameMap
 from .configs import (
     CompressedTensorsConfig,
+    DenseFp8OverrideConfig,
     Fp8BlockConfig,
     ModelOptConfig,
     Mxfp4Config,
@@ -35,6 +36,7 @@ from .configs import (
     get_quant_config,
     quant_method_for,
     quantization_config_of,
+    dense_fp8_override,
     set_quant_config,
 )
 
@@ -49,4 +51,5 @@ __all__ = [
     "QuantBackend", "set_quant_backend", "get_quant_backend", "NameMap",
     "QuantConfig", "NoQuantConfig", "ModelOptConfig", "CompressedTensorsConfig", "Fp8BlockConfig", "Mxfp4Config",
     "quant_method_for", "quantization_config_of", "set_quant_config", "get_quant_config", "finalize_quant",
+    "DenseFp8OverrideConfig", "dense_fp8_override",
 ]

@@ -15,6 +15,33 @@ from .base import LinearConfig, LinearKernel, LinearMethod
 FP8 = torch.float8_e4m3fn
 
 
+class MetalFp8TensorLinearKernel(LinearKernel):
+    """W8A16 through the Metal GEMV."""
+
+    name = "metal"
+
+    def unusable_reason(self, cfg: LinearConfig) -> str | None:
+        return None if backend.is_mps() else "the Metal fp8 GEMV needs torch mps"
+
+    def finalize(self, layer: Any) -> None:
+        # free: a reinterpret, not a value conversion (which MPS has no fp8 op for)
+        if layer.weight.dtype is not torch.uint8:
+            layer.weight = layer.weight.view(torch.uint8)
+        layer.weight_scale = layer.weight_scale.to(torch.float32).contiguous()
+
+    def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.metal.fp8 import fp8_linear
+
+        return fp8_linear(x, layer.weight, layer.weight_scale, layer.bias)
+
+    def apply_fused(self, layer: Any, x: torch.Tensor, *, norm=None, extra_weight=None, conv=None):
+        """The projection with its neighbours folded into the one GEMV launch."""
+        from freetoken.kernel.metal.fp8 import fp8_linear
+
+        return fp8_linear(x, layer.weight, layer.weight_scale, layer.bias,
+                          extra_weight=extra_weight, conv=conv, norm=norm)
+
+
 class TorchFp8TensorLinearKernel(LinearKernel):
     """Static W8A8 through torch._scaled_mm; needs the checkpoint's input_scale and fp8 tensor cores."""
 
@@ -57,6 +84,9 @@ class TritonFp8TensorLinearKernel(LinearKernel):
 
     name = "triton"
 
+    def unusable_reason(self, cfg: LinearConfig) -> str | None:
+        return backend.triton_unusable_reason()
+
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
         from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
 
@@ -75,7 +105,7 @@ class EmulationFp8TensorLinearKernel(LinearKernel):
 
 @register_method(QuantKind.FP8_TENSOR, LayerKind.LINEAR)
 class Fp8TensorLinearMethod(LinearMethod):
-    candidates = (TorchFp8TensorLinearKernel, TritonFp8TensorLinearKernel, EmulationFp8TensorLinearKernel)
+    candidates = (MetalFp8TensorLinearKernel, TorchFp8TensorLinearKernel, TritonFp8TensorLinearKernel, EmulationFp8TensorLinearKernel)
 
     def create_weights(self, layer: Any) -> None:
         g = self.cfg

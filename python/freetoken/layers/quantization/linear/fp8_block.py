@@ -6,6 +6,8 @@ from typing import Any
 
 import torch
 
+from freetoken.kernel import backend
+
 from ..registry import LayerKind, register_method
 from ..scheme import FP8_BLOCK as BLOCK, QuantKind
 from .base import LinearConfig, LinearKernel, LinearMethod
@@ -38,6 +40,9 @@ class TritonFp8BlockLinearKernel(LinearKernel):
     name = "triton"
 
     def unusable_reason(self, cfg: LinearConfig) -> str | None:
+        reason = backend.triton_unusable_reason()
+        if reason:
+            return reason
         return "reads float block scales; e8m0 codes go to the dsv4 kernel" if _e8m0(cfg) else None
 
     def apply(self, layer: Any, x: torch.Tensor) -> torch.Tensor:
