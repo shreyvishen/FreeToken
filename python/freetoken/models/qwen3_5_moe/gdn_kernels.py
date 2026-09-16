@@ -21,14 +21,9 @@ def gdn_prefill_chunk_fla(
     if q.device.type == "mps":
         from freetoken.kernel.metal.gdn import gdn_prefill_metal
 
-        if return_h:
-            raise NotImplementedError(
-                "metal GDN prefill has no per-chunk h yet; the hybrid-radix track "
-                "checkpoint (--cache-type hybrid_radix) is CUDA-only on this path"
-            )
         return gdn_prefill_metal(
             q, k, v, g, beta, state_source=state_source, indices=indices, cu_seqlens=cu_seqlens,
-            scale=scale, cu_seqlens_host=cu_seqlens_host,
+            scale=scale, return_h=return_h, cu_seqlens_host=cu_seqlens_host,
         )
     from freetoken.kernel.fla import chunk_gated_delta_rule
 

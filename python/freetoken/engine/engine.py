@@ -1362,14 +1362,6 @@ def _resolve_cache_type(has_linear_attention: bool, requested: str) -> str:
     # boundaries -> cross-request prefix reuse). An explicit ``--cache-type naive`` opts out
     # to the old no-reuse path (debugging / parity baseline / lower GDN-state memory).
     if has_linear_attention:
-        if requested != "naive" and is_mps():
-            # HybridRadixCache snapshots GDN state from the per-chunk ``h`` the fla chunked
-            # kernel returns; the Metal GDN kernel is sequential in T and produces no ``h``.
-            logger.info_rank0(
-                "hybrid_radix needs the fla chunked kernel's per-chunk state, which "
-                "the Metal GDN kernel does not produce; using cache_type='naive'"
-            )
-            return "naive"
         return "naive" if requested == "naive" else "hybrid_radix"
     return requested
 

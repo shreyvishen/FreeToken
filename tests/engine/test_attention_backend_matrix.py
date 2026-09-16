@@ -402,20 +402,8 @@ def dataclasses_replace_groups(mc, groups):
     return dataclasses.replace(mc, attention_groups=groups)
 
 
-def test_linear_attention_defaults_to_hybrid_radix(monkeypatch):
-    from freetoken.engine import engine
+def test_linear_attention_defaults_to_hybrid_radix():
     from freetoken.engine.engine import _resolve_cache_type
 
-    monkeypatch.setattr(engine, "is_mps", lambda: False)  # CUDA tree
     assert _resolve_cache_type(True, "radix") == "hybrid_radix"
     assert _resolve_cache_type(True, "naive") == "naive"
-
-
-def test_linear_attention_falls_back_to_naive_on_mps(monkeypatch):
-    """No per-chunk GDN state on Metal, so no hybrid-radix snapshot to take."""
-    from freetoken.engine import engine
-    from freetoken.engine.engine import _resolve_cache_type
-
-    monkeypatch.setattr(engine, "is_mps", lambda: True)
-    assert _resolve_cache_type(True, "radix") == "naive"
-    assert _resolve_cache_type(False, "radix") == "radix"  # dense model, unaffected

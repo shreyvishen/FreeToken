@@ -99,3 +99,32 @@ head-to-head with the rows above.** What it does show is the shape of the curve:
 MLX to 8192 x 8192, that remaining slope is the MoE and dense GEMM path at long extend lengths, not
 attention. A same-model comparison needs the 35B GGUF and MLX checkpoints, which are not on this
 disk.
+
+## Prefix cache -- second-turn TTFT on a conversation (16 Sep 2026)
+
+`hybrid_radix` is the default for GDN models on Metal from the commit that emits the per-chunk
+GDN state. Turn 2 of a conversation restores the newest state snapshot at or before the shared
+prefix and prefills only the tail, instead of recomputing the whole prompt.
+
+SCREEN, 2 repetitions, AC, idle machine, 35B NVFP4 resident:
+
+| Conversation | Cache type | Turn 1 TTFT (s) | Turn 2 TTFT (s) | Turn 2 tokens prefilled |
+|---|---|---|---|---|
+| 4,565 tokens | `naive` | 9.436 | 10.730 | 4,565 of 4,565 |
+| 4,565 tokens | `hybrid_radix` | 10.363 | **0.631** | **12** of 4,565 |
+| 18,065 tokens | `naive` | 59.124 | 62.831 | 9,873 of 18,065 (chunked) |
+| 18,065 tokens | `hybrid_radix` | 54.066 | **0.867** | **12** of 18,065 |
+
+Second-turn TTFT is 17.0x lower on the short conversation and 72.4x lower on the long one, and the
+generated text is byte-identical between the two cache types at both sizes. The reuse is what
+scales: turn 2 prefills 12 tokens whatever the history length.
+
+Turn 1 pays for the snapshots. On the 4,565-token conversation that is 0.93 s, about 10 %; measured
+directly against prefill, the per-chunk state copy-out costs 27.8 % of a 722-token prefill, 10.0 %
+of a 2,873-token one and 8.1 % of an 11,474-token one, because the extra launches are a fixed count
+per 64-token chunk. At 18k it is inside the run-to-run spread. `--cache-type naive` opts out.
+
+```
+REPS=2 N=3000 bash .notes/briefs/screen_prefix.sh 30421 p6-prefix-hybrid
+REPS=2 N=3000 bash .notes/briefs/screen_prefix.sh 30422 p6-prefix-naive --cache-type naive
+```

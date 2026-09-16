@@ -101,14 +101,16 @@ def _build_track_metadata(reqs, cu_host, device, pin):
         return empty
     from freetoken.core import get_global_ctx
     from freetoken.kernel.fla.const import CHUNK_SIZE
-    from freetoken.kernel.fla.index import prepare_chunk_offsets
 
     km1 = get_global_ctx().linear_state_pool.conv_states.shape[-1]  # conv_kernel_dim - 1
     assert km1 <= CHUNK_SIZE, (
         f"conv history {km1} exceeds CHUNK_SIZE {CHUNK_SIZE}: the snapshot window "
         "would reach before this forward's first token"
     )
-    boh = prepare_chunk_offsets(cu_host, CHUNK_SIZE).tolist()
+    # fla.index.prepare_chunk_offsets inlined: importing it pulls triton in at module scope,
+    # and triton is not installable on Metal (triton.cdiv is (x + y - 1) // y).
+    lens = cu_host[1:] - cu_host[:-1]
+    boh = [0, *((lens + CHUNK_SIZE - 1) // CHUNK_SIZE).cumsum(0).tolist()]
     dst, h_row, conv_src, boundary_rows = [], [], [], []
     for i, r in enumerate(reqs):
         if r.mamba_ping_pong is None:

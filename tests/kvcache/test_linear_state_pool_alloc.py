@@ -2,6 +2,8 @@
 CPU-only, fast — pure slot bookkeeping + state copy/zero, no kernels."""
 from __future__ import annotations
 
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -71,6 +73,84 @@ def test_copy_from_snapshot():
     pool.copy_from(src, dst)
     assert torch.equal(pool.conv_states[:, dst], pool.conv_states[:, src])
     assert torch.equal(pool.recurrent_states[:, dst], pool.recurrent_states[:, src])
+
+
+def _tracked_req(n_tokens, table_idx, pool, first_id):
+    """A prefill Req with the live + ping-pong slots the hybrid path allocates at admission."""
+    from freetoken.core import Req, SamplingParams
+
+    ids = torch.arange(first_id, first_id + n_tokens, dtype=torch.int32)
+    req = Req(input_ids=ids, table_idx=table_idx, cached_len=0, output_len=1, uid=table_idx,
+              sampling_params=SamplingParams(), cache_handle=None)
+    req.linear_slot_idx = pool.alloc(1)[0]
+    req.mamba_ping_pong = tuple(pool.alloc(2))
+    return req
+
+
+def test_snapshot_round_trip_through_the_radix_tree(monkeypatch):
+    """Turn 2 on CPU, no kernel: snapshot row pick, GDN state write, radix reuse cut back to the chunk boundary, restore."""
+    from freetoken.attention.linear import build_fla_metadata
+    from freetoken.kernel.fla.const import CHUNK_SIZE
+    from freetoken.kvcache.hybrid_radix_cache import HybridRadixCache
+    from freetoken.models.qwen3_5_moe.gdn import Qwen3_5GatedDeltaNet
+
+    pool = _pool(num_slots=12)
+    km1, conv_dim = pool.conv_states.shape[-1], pool.conv_states.shape[-2]
+    # two ragged requests, so the second one's row depends on the first one's chunk count
+    reqs = [_tracked_req(CHUNK_SIZE + 6, 0, pool, 0),
+            _tracked_req(2 * CHUNK_SIZE + 3, 1, pool, 500)]
+    monkeypatch.setattr("freetoken.core.get_global_ctx",
+                        lambda: SimpleNamespace(linear_state_pool=pool))
+    batch = SimpleNamespace(padded_reqs=reqs, is_decode=False)
+    fla = build_fla_metadata(batch, torch.device("cpu"))
+    # the tracking path must stay importable without triton, which Metal cannot install; a fresh
+    # interpreter, since this one has triton loaded wherever it is installed
+    probe = "import sys, freetoken.attention.linear; assert 'triton' not in sys.modules"
+    subprocess.run([sys.executable, "-c", probe], check=True)
+
+    nchunks = [-(-r.extend_len // CHUNK_SIZE) for r in reqs]
+    assert nchunks == [2, 3]
+    assert fla.track_h_row.tolist() == [1, 2 + 2]          # boh = [0, 2, 5], c = [1, 2]
+    assert fla.track_dst.tolist() == [r.mamba_ping_pong[0] for r in reqs]
+    assert [r.mamba_last_track_seqlen for r in reqs] == [CHUNK_SIZE, 2 * CHUNK_SIZE]
+    assert [r.mamba_next_track_idx for r in reqs] == [1, 1]
+
+    total = sum(r.extend_len for r in reqs)
+    torch.manual_seed(3)
+    conv_in = torch.randn(total, conv_dim)
+    h = torch.randn(1, sum(nchunks), *pool.recurrent_states.shape[2:])
+    # __new__, not __init__: the snapshot reads only its arguments, and the real constructor
+    # would allocate the layer's projections and need TP info for nothing.
+    op = Qwen3_5GatedDeltaNet.__new__(Qwen3_5GatedDeltaNet)
+    op._write_track_snapshot(pool, pool.local_index(0), conv_in, h, fla)
+
+    req, frozen = reqs[1], reqs[1].mamba_ping_pong[0]
+    assert torch.equal(pool.recurrent_states[0, frozen],
+                       h[0, 4].to(pool.recurrent_states.dtype))
+    want_conv = conv_in[fla.track_conv_src[1]].t().to(pool.conv_states.dtype)
+    assert torch.equal(pool.conv_states[0, frozen], want_conv)
+
+    # the scheduler donates the frozen slot at the tracked boundary, the live one at finish
+    boundary = req.mamba_last_track_seqlen
+    prompt = req.input_ids.to(torch.int64)
+    kv = torch.arange(100, 100 + len(prompt), dtype=torch.int32)
+    tree = HybridRadixCache(torch.device("cpu"), page_size=1)
+    assert tree.insert(prompt[:boundary], kv[:boundary], frozen) == (0, False)
+    assert tree.insert(prompt, kv, req.linear_slot_idx) == (boundary, False)
+
+    # turn 2 shares the prefix then diverges INSIDE the deeper node (which spans 128..131), so
+    # the split leaves its root-side half snapshot-less -> reuse falls back to the x64 boundary
+    turn2 = torch.cat([prompt[:boundary + 2], torch.arange(900, 940, dtype=torch.int64)])
+    m = tree.match_prefix(turn2)
+    assert m.cached_len == boundary and m.mamba_value == frozen
+    assert torch.equal(m.kv_indices, kv[:boundary])
+
+    restore = pool.alloc(1)[0]
+    pool.copy_from(m.mamba_value, restore)   # scheduler._restore_linear_states
+    assert torch.equal(pool.recurrent_states[:, restore], pool.recurrent_states[:, frozen])
+    assert torch.equal(pool.conv_states[:, restore], pool.conv_states[:, frozen])
+    # the un-diverged turn still resumes at the deeper, newer snapshot
+    assert tree.match_prefix(prompt).mamba_value == req.linear_slot_idx
 
 
 if __name__ == "__main__":
