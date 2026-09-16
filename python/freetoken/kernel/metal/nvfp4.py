@@ -12,6 +12,7 @@ from freetoken.kernel.metal._shaders import (
     GATE_UP_GROUPED_SRC,
     GATE_UP_SRC,
     GEMV_SRC,
+    MOE_TILED_SRC,
     specialize,
 )
 
@@ -256,6 +257,16 @@ def moe_prefill_nvfp4(
 # and NM activation pointers live across the whole K loop, and past 2 that block spills.
 _MAX_GROUP_ROWS = 2
 
+# The tiled kernel's threadgroup: 4 SIMD-groups over NR0 output columns and 32 routes.
+_TILED_THREADS = 128
+_TILED_NR0 = 64
+
+# Under one 32-route tile per expert the tiled kernel still reads every routed expert's weights
+# in full, so its cost floors near 5.8 ms whatever M is and the row-grouped kernel's finer
+# threadgroups win. At the 35B's shapes the two tie at M 224 and the tiled one leads from 256 up
+# (2.1x at 512, 7.4x at 8192); benchmarks/bench_moe_prefill.py measures it.
+_TILED_MIN_M = 256
+
 
 def moe_prefill_nvfp4_grouped(
     x: torch.Tensor, gate_up_packed: torch.Tensor, gate_up_scale: torch.Tensor,
@@ -265,7 +276,9 @@ def moe_prefill_nvfp4_grouped(
     tile_down: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Grouped-by-expert prefill MoE: same contract and same bytes as
-    :func:`moe_prefill_nvfp4`, in two custom launches and with no bf16 copy of any expert."""
+    :func:`moe_prefill_nvfp4`, in two custom launches and with no bf16 copy of any expert.
+    Past ``_TILED_MIN_M`` tokens the launches are tiled GEMMs on the matrix units; naming any
+    of the row-grouped kernel's own knobs keeps that kernel instead."""
     x = x.contiguous().float()
     m, h = x.shape
     top_k = topk_ids.shape[1]
@@ -289,6 +302,25 @@ def moe_prefill_nvfp4_grouped(
     route_id = order.to(torch.int32)
     route_row = torch.div(order, top_k, rounding_mode="floor").to(torch.int32)
     route_w = topk_weights.reshape(-1).float().contiguous()
+
+    if m >= _TILED_MIN_M and not (group_rows or tile_gate_up or tile_down):
+        inter_buf = torch.empty((routes, inter), dtype=torch.float32, device=dev)
+        compile(specialize(MOE_TILED_SRC, KDIM=h, NDIM=inter, GATE_UP=1)).nvfp4_moe_tiled(
+            inter_buf, x, gate_up_packed.view(torch.int32), as_e4m3_bytes(gate_up_scale),
+            gate_up_global, route_row, route_id, offsets, route_w,
+            threads=(_TILED_THREADS * -(-inter // _TILED_NR0), experts),
+            group_size=(_TILED_THREADS, 1),
+        )
+        parts = torch.empty((routes, h), dtype=torch.float32, device=dev)
+        # inter_buf is already in natural route order, so the down GEMM reads and writes a
+        # route under the same index and route_id serves as both maps.
+        compile(specialize(MOE_TILED_SRC, KDIM=inter, NDIM=h, GATE_UP=0)).nvfp4_moe_tiled(
+            parts, inter_buf, down_packed.view(torch.int32), as_e4m3_bytes(down_scale),
+            down_global, route_id, route_id, offsets, route_w,
+            threads=(_TILED_THREADS * -(-h // _TILED_NR0), experts),
+            group_size=(_TILED_THREADS, 1),
+        )
+        return parts.view(m, top_k, h).sum(1)
 
     # A chunk of NM routes loads each weight word once for NM accumulators, but a shorter chunk
     # pays for the rows it clamps away, so the mean run length is the break-even.

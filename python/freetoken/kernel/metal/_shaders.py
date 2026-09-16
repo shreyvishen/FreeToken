@@ -597,3 +597,170 @@ kernel void nvfp4_moe_down_grouped(
     }
 }
 """
+
+# Prefill, large M: a tiled grouped GEMM per expert, serving both halves of the MoE block. A
+# threadgroup owns NR0 output columns of one expert and walks that expert's routes NR1 at a
+# time, staging the dequantized weight tile and the activation tile once per NK slice and
+# feeding the 8x8 matrix units from them, so the weight tile is read ceil(routes/NR1) times
+# per expert instead of once per pair of routes. Tiling and block layout follow mul_mm.metal.
+MOE_TILED_SRC = _PRELUDE + r"""
+#include <metal_simdgroup_matrix>
+
+#define NR0 64                   // weight rows (output columns) per threadgroup
+#define NR1 32                   // routes per chunk
+#define NK  32                   // K elements staged per step
+#define NPL (GATE_UP + 1)        // weight planes: gate and up together, or down alone
+#define WSTRIDE (NDIM * NPL)     // weight rows per expert
+#define WORDS (KDIM / 8)
+#define BLOCKS (KDIM / 16)
+#define NOUT (NR1 * NR0 / 128)   // output elements each thread carries in the epilogue
+
+// Staged activation scalar. Gate and up together hold 16 accumulator fragments and spill
+// against float A and B fragments: bfloat there measures 2.8x faster and rounds nothing, the
+// residual stream being bfloat16 widened to float32 (layers/quantization/moe/nvfp4.py). The
+// down GEMM has half the accumulators and a real float32 input, so it keeps float.
+#if GATE_UP
+#define AT  bfloat
+#define AT4 bfloat4
+#else
+#define AT  float
+#define AT4 float4
+#endif
+
+kernel void nvfp4_moe_tiled(
+    device       float * out       [[buffer(0)]],   // [R, NDIM] fp32, natural route order
+    device const float * act       [[buffer(1)]],   // [., KDIM] fp32
+    device const uint  * packed    [[buffer(2)]],   // [E, NPL*NDIM, KDIM/8]
+    device const uchar * scale     [[buffer(3)]],   // [E, NPL*NDIM, KDIM/16]
+    device const half  * glob      [[buffer(4)]],   // [E, NPL*NDIM]
+    device const int   * a_row     [[buffer(5)]],   // [R] expert order -> activation row
+    device const int   * o_row     [[buffer(6)]],   // [R] expert order -> natural route
+    device const int   * offsets   [[buffer(7)]],   // [E+1]
+    device const float * route_w   [[buffer(8)]],   // [R] router weight, natural order
+    uint2 tgid  [[threadgroup_position_in_grid]],
+    uint  tiitg [[thread_index_in_threadgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint e  = tgid.y;
+    const int  lo = offsets[e];
+    const int  hi = offsets[e + 1];
+    if (lo >= hi) { return; }          // expert not routed to: no work at all
+
+    const uint n0 = tgid.x * NR0;
+
+    // Both tiles sit in 8x8 blocks laid out so simdgroup_load reads one with stride 8. Each is
+    // declared at the widest type that reads it so the alias below is aligned; the weight
+    // tile's bytes are exactly NR1 x NR0 floats, which is what the epilogue needs.
+    threadgroup float sc[NR1 * NR0];
+    threadgroup AT4   sa4[NR1 * NK / 4];
+    threadgroup half * sw = (threadgroup half *) sc;
+    threadgroup AT   * sa = (threadgroup AT *) sa4;
+
+    // Four words of eight e2m1 codes cover one weight row's NK slice, so 128 threads stage 32
+    // rows per pass; the activation tile is one thread per (route, k-block).
+    const uint kb = tiitg % (NK / 8u);
+    const uint rw = tiitg / (NK / 8u);
+
+    for (int c = lo; c < hi; c += NR1) {
+        simdgroup_float8x8 mc[NPL][8];
+        for (uint p = 0; p < NPL; ++p) {
+            for (uint i = 0; i < 8; ++i) { mc[p][i] = simdgroup_float8x8(0.0f); }
+        }
+
+        for (uint k0 = 0; k0 < uint(KDIM); k0 += NK) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint w = k0 / 8u + kb;
+            for (uint p = 0; p < NPL; ++p) {
+                for (uint nl = rw; nl < NR0; nl += 128u / (NK / 8u)) {
+                    // Clamp rather than branch: a tail tile re-reads the last row and drops
+                    // the store, so every lane stays on one path through the K loop.
+                    const long row = long(e) * WSTRIDE + long(p) * NDIM
+                                   + long(min(n0 + nl, uint(NDIM) - 1u));
+                    const uint pk = (w < WORDS) ? packed[row * WORDS + long(w)] : 0u;
+                    // An e2m1 code times an e4m3 block scale needs five mantissa bits, so
+                    // half holds it exactly; the per-row global scale stays in the epilogue.
+                    const float s = (w < WORDS)
+                        ? e4m3_u8_to_f32(scale[row * BLOCKS + long(w >> 1)]) : 0.0f;
+                    const float4 c0 = e2m1x4(pk) * s;
+                    const float4 c1 = e2m1x4(pk >> 16) * s;
+                    threadgroup half * d = sw + p * (NR0 * NK)
+                                         + 64u * (8u * kb + (nl >> 3)) + (nl & 7u);
+                    d[0]  = half(c0.x);  d[8]  = half(c0.y);
+                    d[16] = half(c0.z);  d[24] = half(c0.w);
+                    d[32] = half(c1.x);  d[40] = half(c1.y);
+                    d[48] = half(c1.z);  d[56] = half(c1.w);
+                }
+            }
+
+            const uint ak = k0 + 8u * kb;
+            threadgroup AT4 * ad = (threadgroup AT4 *)
+                (sa + 64u * (4u * kb + (rw >> 3)) + 8u * (rw & 7u));
+            if (ak < uint(KDIM)) {
+                device const float4 * as4 = (device const float4 *)
+                    (act + ulong(a_row[min(c + int(rw), hi - 1)]) * KDIM + ak);
+                ad[0] = AT4(as4[0]);  ad[1] = AT4(as4[1]);
+            } else {
+                ad[0] = AT4(0);  ad[1] = AT4(0);
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint ik = 0; ik < NK / 8u; ++ik) {
+                simdgroup_matrix<AT, 8, 8> mb[2];
+                threadgroup const AT * lb = sa + 128u * (sgitg >> 1) + ik * 256u;
+                simdgroup_barrier(mem_flags::mem_none);
+                for (uint i = 0; i < 2; ++i) { simdgroup_load(mb[i], lb + 64u * i, 8); }
+                for (uint p = 0; p < NPL; ++p) {
+                    simdgroup_matrix<half, 8, 8> ma[4];
+                    threadgroup const half * la = sw + p * (NR0 * NK)
+                                                + 256u * (sgitg & 1u) + ik * 512u;
+                    simdgroup_barrier(mem_flags::mem_none);
+                    for (uint i = 0; i < 4; ++i) { simdgroup_load(ma[i], la + 64u * i, 8); }
+                    simdgroup_barrier(mem_flags::mem_none);
+                    for (uint i = 0; i < 8; ++i) {
+                        simdgroup_multiply_accumulate(mc[p][i], mb[i / 4], ma[i % 4], mc[p][i]);
+                    }
+                }
+            }
+        }
+
+        // The accumulators land in the weight tile's bytes as [NR1][NR0] floats; the store is
+        // a scatter (expert order -> natural route), so plain threads finish it.
+        threadgroup float * ts = sc + 32u * (sgitg & 1u) + 1024u * (sgitg >> 1);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < 8; ++i) {
+            simdgroup_store(mc[0][i], ts + 8u * (i % 4) + 8u * NR0 * (i / 4), NR0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#if GATE_UP
+        // Gate and up share the one tile, so the gate half moves to registers first.
+        float gv[NOUT];
+        #pragma unroll
+        for (uint j = 0; j < NOUT; ++j) { gv[j] = sc[tiitg + j * 128u]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < 8; ++i) {
+            simdgroup_store(mc[1][i], ts + 8u * (i % 4) + 8u * NR0 * (i / 4), NR0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#endif
+        #pragma unroll
+        for (uint j = 0; j < NOUT; ++j) {
+            const uint i  = tiitg + j * 128u;
+            const uint ml = i / NR0;
+            const uint nl = i % NR0;
+            if (c + int(ml) >= hi || n0 + nl >= uint(NDIM)) { continue; }
+            const uint rid = uint(o_row[c + int(ml)]);
+            const long grow = long(e) * WSTRIDE + long(n0 + nl);
+#if GATE_UP
+            const float g = gv[j] * float(glob[grow]);
+            const float u = sc[i] * float(glob[grow + NDIM]);
+            // silu(gate) * up, matching kernel/triton/activation.py:6 with d = NDIM.
+            out[ulong(rid) * NDIM + n0 + nl] = (g / (1.0f + exp(-g))) * u;
+#else
+            out[ulong(rid) * NDIM + n0 + nl] = sc[i] * float(glob[grow]) * route_w[rid];
+#endif
+        }
+    }
+}
+"""
