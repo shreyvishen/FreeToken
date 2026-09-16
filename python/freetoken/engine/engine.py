@@ -559,10 +559,17 @@ class Engine:
             return None
         from freetoken.engine.cache_budget import resolve_kv_cap_pages
 
-        return resolve_kv_cap_pages(
+        pages = resolve_kv_cap_pages(
             max_running_req=config.max_running_req, max_seq_len=config.max_seq_len,
             kv_cap_tokens=config.kv_cap_tokens, page_size=page_tokens,
         )
+        # --num-tokens is already resolved into num_page_override (_adjust_config, called
+        # before the pools are built), and solve_num_pages hands it back verbatim, so the KV
+        # pool gets it whatever the plan says. Raise the cap to match or the plan sizes the
+        # expert slots against a KV pool smaller than the one that is actually allocated.
+        if config.num_page_override is not None:
+            pages = max(pages, config.num_page_override)
+        return pages
 
     @torch.inference_mode()
     def _warmup_encoders(self) -> None:

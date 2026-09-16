@@ -17,6 +17,15 @@ TTFT is the measured run's warm first-token latency (template rendering + prefil
 included). Engine-internal diagnostics (expert-cache miss rate, hybrid fetch split) are
 not exposed over the API and are not reported; VRAM is the server's live /v1/stats figure.
 
+Prefill: ``--prefill`` adds a prefill tok/s row, measured after decode on the same running
+server (no second server spawn). Method mirrors llama-bench's ``pN`` row, which also times
+prompt processing alone:
+
+    prefill_tok_s = (prompt_tokens(N) - prompt_tokens(base)) / (median t(N) - median t(base))
+
+every request ``max_tokens=1``/``temperature=0``, 3 reps/length by default with the median
+taken, and a fresh salt per repetition so a prefix cache can't shortcut the second rep.
+
 Prompt: an AIME-25 problem sent as a chat message with thinking enabled -- a real
 reasoning workload, so expert routing is representative. The server renders the chat
 template (including checkpoint-shipped encoders like DSV4's ``encoding_dsv4.py``). The
@@ -51,6 +60,7 @@ import json
 import os
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -71,6 +81,10 @@ AIME_FILE = "test.jsonl"
 BOXED_INSTRUCTION = (
     "Please reason step by step, and put your final answer within \\boxed{}."
 )
+
+# Filler words for synthetic prefill prompts. One word ~= one token for this tokenizer
+# family is close enough; the real count always comes back from usage.prompt_tokens.
+PREFILL_WORDS = "alpha bravo charlie delta echo foxtrot golf hotel india juliet".split()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -120,6 +134,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="seconds to wait for the spawned server to become ready",
     )
     p.add_argument("--json", dest="json_out", default=None, help="append the result rows here")
+    p.add_argument(
+        "--prefill",
+        default="512,2048,8192",
+        help="comma list of prompt lengths (tokens) for the prefill tok/s row; empty = skip it",
+    )
+    p.add_argument(
+        "--prefill-reps",
+        type=int,
+        default=3,
+        help="repetitions per prefill length; the median wall time is reported",
+    )
     return p.parse_args(argv)
 
 
@@ -312,6 +337,42 @@ def stream_generate(origin: str, model_id: str, problem: str, sampling: dict,
     return {"t0": t0, "stamps": stamps, "text": "".join(pieces), "usage": usage}
 
 
+def parse_prefill_lengths(spec: str) -> list[int]:
+    """Comma list of token counts; blank/whitespace-only entries drop out, "" means skip."""
+    return [int(x) for x in spec.split(",") if x.strip()]
+
+
+def prefill_prompt(n_tokens: int, salt: str) -> str:
+    return f"{salt} " + " ".join(PREFILL_WORDS[i % len(PREFILL_WORDS)] for i in range(n_tokens))
+
+
+def call_prefill(origin: str, model_id: str, prompt: str) -> tuple[float, dict]:
+    """One non-streamed /v1/completions call at max_tokens=1: decode is a single step, so the
+    wall time is (almost) all prefill."""
+    body = json.dumps({
+        "model": model_id, "prompt": prompt, "max_tokens": 1, "temperature": 0,
+    }).encode()
+    req = urllib.request.Request(
+        f"{origin}/v1/completions", data=body, headers={"Content-Type": "application/json"},
+    )
+    t0 = time.perf_counter()
+    with urllib.request.urlopen(req, timeout=1800) as resp:
+        out = json.load(resp)
+    return time.perf_counter() - t0, out
+
+
+def measure_prefill(origin: str, model_id: str, n_tokens: int, reps: int, salt: int) -> tuple[int, float, list[float]]:
+    """Real prompt_tokens (from usage, not requested) and median wall time over ``reps`` runs."""
+    times: list[float] = []
+    prompt_tokens = 0
+    for rep in range(reps):
+        prompt = prefill_prompt(n_tokens, salt=f"{salt}-{rep}")
+        t, out = call_prefill(origin, model_id, prompt)
+        times.append(t)
+        prompt_tokens = out["usage"]["prompt_tokens"]
+    return prompt_tokens, statistics.median(times), [round(t, 4) for t in times]
+
+
 def run_one(args: argparse.Namespace, backend: str) -> dict:
     problem, answer = load_problem(args.aime, args.problem)
     sampling, sampling_src = resolve_sampling(args.model, args.greedy)
@@ -345,6 +406,29 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
             stream_generate(origin, model_id, problem, sampling, args)
             r = stream_generate(origin, model_id, problem, sampling, args)
             stats = get_json(f"{origin}/v1/stats")
+
+            prefill_lengths = parse_prefill_lengths(args.prefill)
+            prefill_rows: list[dict] = []
+            prefill_base_pt = prefill_base_t = base_runs = None
+            prefill_stats = None
+            if prefill_lengths:
+                call_prefill(origin, model_id, prefill_prompt(64, "warm"))  # warm kernels first
+                prefill_base_pt, prefill_base_t, base_runs = measure_prefill(
+                    origin, model_id, 8, args.prefill_reps, salt=7
+                )
+                for i, n in enumerate(prefill_lengths):
+                    pt, t, runs = measure_prefill(origin, model_id, n, args.prefill_reps, salt=1000 + i)
+                    dt, dn = t - prefill_base_t, pt - prefill_base_pt
+                    prefill_rows.append({
+                        "prompt_tokens": pt,
+                        "median_s": t,
+                        "prefill_tok_s": dn / dt if dt > 0 else 0.0,
+                        "ttft_ms": t * 1e3,
+                        "runs": runs,
+                    })
+                # Live VRAM after the longest length, so a memory regression at long prompts
+                # shows up in the same table as the decode row's figure.
+                prefill_stats = get_json(f"{origin}/v1/stats")
         finally:
             stop_server(proc)
             pump.join(timeout=10)
@@ -375,6 +459,11 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
         "sampling": sampling,
         "output_sha1": hashlib.sha1(r["text"].encode()).hexdigest()[:12],
         "server_log": log_path,
+        "prefill_base_tokens": prefill_base_pt,
+        "prefill_base_median_s": prefill_base_t,
+        "prefill_base_runs": base_runs,
+        "prefill": prefill_rows,
+        "prefill_vram_gib": (prefill_stats.get("vram_bytes", 0) / 2**30) if prefill_stats else None,
     }
 
     print(f"\n==== decode bs=1 [{backend}] via /v1/chat/completions ====", flush=True)
@@ -387,6 +476,15 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
     sha_note = "greedy" if args.greedy else "sampled, per-server deterministic"
     print(f"  output sha1       : {row['output_sha1']}  ({sha_note}; compare across backends)")
     print(f"  output sample     : {r['text'][:240]!r}")
+    if row["prefill"]:
+        print(f"\n==== prefill [{backend}] via /v1/completions ====", flush=True)
+        print(f"  base              : prompt_tokens={row['prefill_base_tokens']} "
+              f"median={row['prefill_base_median_s']:.4f}s")
+        print(f"  {'tokens':>8} {'median_s':>10} {'prefill_tok_s':>14} {'ttft_ms':>9}  runs")
+        for pr in row["prefill"]:
+            print(f"  {pr['prompt_tokens']:>8} {pr['median_s']:>10.4f} {pr['prefill_tok_s']:>14.1f} "
+                  f"{pr['ttft_ms']:>9.1f}  {pr['runs']}")
+        print(f"  vram (after longest prefill): {row['prefill_vram_gib']:8.2f} GiB")
     return row
 
 
