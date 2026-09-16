@@ -6,7 +6,11 @@ import pytest
 import torch
 
 from freetoken.kernel.metal import is_available
-from freetoken.kernel.metal.attention import paged_attention_mps, paged_decode_attention_mps
+from freetoken.kernel.metal.attention import (
+    paged_attention_mps,
+    paged_decode_attention_mps,
+    prefill_tile,
+)
 from tests.kernels.reference_attention import reference_paged_attention
 
 pytestmark = pytest.mark.skipif(not is_available(), reason="needs a torch build with MPS")
@@ -86,6 +90,53 @@ def test_prefill():
     got, want = _run(paged_attention_mps, q, k, v, torch.tensor([0, 6, 17]), order,
                      torch.tensor([0, 6, 9]))
     torch.testing.assert_close(got, want, rtol=2e-5, atol=2e-5)   # page order, not slot order
+
+
+# (q lengths, kv lengths) per request. 37 is not a multiple of any query tile, so its last
+# row block is only partly live; 100 queries after a 900-token prefix is the chunked-prefill
+# case, with enough KV tiles for the running softmax to be rescaled many times over.
+_PREFILL_BATCHES = (([12], [12]), ([5], [14]), ([37], [64]), ([100], [1000]),
+                    ([6, 3, 1, 40], [6, 11, 40, 40]))
+
+
+@pytest.mark.parametrize("dtype,tol", ((torch.float32, 2e-5), (torch.bfloat16, 8e-3)))
+def test_tiled_prefill_matches_the_oracle(dtype, tol):
+    assert prefill_tile(HEAD_DIM, torch.empty((), dtype=dtype).element_size()) is not None, (
+        "the tiled kernel must own Qwen3.6's shape, or this file is testing the SDPA fallback"
+    )
+    for q_lens, kv_lens in _PREFILL_BATCHES:
+        total, slots = sum(kv_lens), sum(kv_lens) + 9
+        q, k, v = _cache(slots, sum(q_lens), dtype=dtype, seed=total)
+        # scattered slots: a kernel that walked the pool in slot order rather than page order
+        # would pass every contiguous case and fail here
+        indices = torch.randperm(slots)[:total].to(torch.int32)
+        cum = lambda lens: torch.tensor([0] + torch.tensor(lens).cumsum(0).tolist(),
+                                        dtype=torch.int32)
+        got, want = _run(paged_attention_mps, q, k, v, cum(kv_lens), indices, cum(q_lens))
+        assert got.dtype == dtype
+        torch.testing.assert_close(got.float(), want.float(), rtol=tol, atol=tol)
+
+
+def test_prefill_falls_back_when_the_kernel_has_no_shape_for_it():
+    md = (torch.tensor([0, 12, 30], dtype=torch.int32),
+          torch.randperm(40)[:30].to(torch.int32),
+          torch.tensor([0, 4, 9], dtype=torch.int32))
+    # head_dim 20 leaves a tail no 8x8 fragment covers
+    assert prefill_tile(20, 2) is None
+    q, k, v = _cache(40, 9, hq=4, hk=2, d=20, seed=2)
+    got, want = _run(paged_attention_mps, q, k, v, *md, scale=20**-0.5)
+    torch.testing.assert_close(got, want, rtol=2e-5, atol=2e-5)
+
+    # and a K/V cache sliced out of a wider tensor is not the flat slab the kernel indexes
+    q, wide_k, wide_v = _cache(40, 9, hk=2 * KV_HEADS, seed=3)
+    q, wide_k, wide_v = (t.to("mps") for t in (q, wide_k, wide_v))
+    k, v = wide_k[:, :KV_HEADS], wide_v[:, :KV_HEADS]
+    assert not k.is_contiguous()
+    got = paged_attention_mps(q, k, v, *[t.to("mps") for t in md], SCALE).cpu()
+    q_to_req, q_positions = _oracle_args(md[0], md[2])
+    want = reference_paged_attention(q.cpu().float(), k.cpu().float(), v.cpu().float(),
+                                     md[0], md[1], q_to_req, q_positions, SCALE, None)
+    torch.testing.assert_close(got, want, rtol=2e-5, atol=2e-5)
 
 
 def test_gqa_head_geometry():

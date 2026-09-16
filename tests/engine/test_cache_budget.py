@@ -298,6 +298,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         max_running_req = 4
         max_seq_len = 262_144
         kv_cap_tokens = None
+        num_page_override = None   # --num-tokens unset: the cap is the plan's own
         hybrid_swa_cache_mode = "auto"
         memory_ratio = 0.9
         moe_prefill_overlap = True
@@ -524,8 +525,13 @@ def test_resolve_kv_cap_pages_takes_the_smaller_bound():
     cap = lambda reqs, seq, tok, page: resolve_kv_cap_pages(
         max_running_req=reqs, max_seq_len=seq, kv_cap_tokens=tok, page_size=page)
     # request limits bind; the token ceiling binds; an explicit ceiling wins; 0 turns it off
-    assert (cap(2, 4096, None, 16), cap(4, 262_144, None, 1), cap(4, 262_144, 4096, 1),
+    assert (cap(2, 4096, None, 16), cap(4, 16_384, None, 1), cap(4, 262_144, 4096, 1),
             cap(4, 262_144, 0, 1)) == (512, DEFAULT_MPS_KV_CAP_TOKENS, 4096, 4 * 262_144)
+    # A single request's own context always fits: the default ceiling rises to meet a long
+    # model rather than leaving most of its window unservable. Concurrency past that one
+    # context still pays the flat default, which is the ceiling's whole job.
+    assert (cap(4, 262_144, None, 1), cap(16, 8192, None, 1)) == (262_144,
+                                                                  DEFAULT_MPS_KV_CAP_TOKENS)
 
 
 def test_mps_headroom_is_absolute_on_a_big_box_and_the_ratio_on_a_small_one():
@@ -566,3 +572,28 @@ def test_mps_driver_bytes_prices_the_122b_disk_tiers_gigabyte_heap():
     sizes = [3274 * n for n in (3145728, 393216, 4096, 1572864, 196608, 6144)] + [
         32 * PER_EXPERT, 65536 * PER_PAGE, 13271040, 754974720]
     assert (sum(sizes), mps_driver_bytes(sizes)) == (19962335232, 20176699392)
+
+
+def test_num_tokens_override_raises_the_kv_plan_cap(monkeypatch):
+    """--num-tokens is handed to the KV pool verbatim (solve_num_pages), so the plan has to
+    size the expert slots against that same number; a cap below it over-commits the budget."""
+    import freetoken.engine.engine as engine_mod
+    from freetoken.engine.engine import Engine
+
+    monkeypatch.setattr(engine_mod, "is_mps", lambda: True)
+    engine = Engine.__new__(Engine)  # bypass __init__/GPU
+
+    class Cfg:
+        max_running_req = 4
+        max_seq_len = 262_144
+        kv_cap_tokens = 65_536
+        num_page_override = None
+
+    assert engine._kv_cap_pages(Cfg(), 1) == 65_536       # the flat cap still binds
+    Cfg.num_page_override = 262_144                       # --num-tokens 262144, page_size 1
+    assert engine._kv_cap_pages(Cfg(), 1) == 262_144      # and the request raises it
+    Cfg.num_page_override = 4_096                         # a small request never lowers it
+    assert engine._kv_cap_pages(Cfg(), 1) == 65_536
+
+    monkeypatch.setattr(engine_mod, "is_mps", lambda: False)
+    assert engine._kv_cap_pages(Cfg(), 1) is None         # CUDA keeps the greedy split

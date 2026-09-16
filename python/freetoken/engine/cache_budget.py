@@ -155,8 +155,9 @@ def mps_net_cache_budget_bytes(
     return baseline_free - headroom - weights_bytes - fixed_cache_size
 
 
-# Unified memory only: KV tokens the plan may take, past which the bytes are better left as
-# host memory. 65536 is what one decode request plus a long prompt addresses.
+# Unified memory only: the KV tokens the plan may take before the bytes are better left as
+# host memory, when concurrency rather than context length is what would spend them. 65536 is
+# four 16k conversations.
 DEFAULT_MPS_KV_CAP_TOKENS = 65536
 
 
@@ -164,10 +165,13 @@ def resolve_kv_cap_pages(
     *, max_running_req: int, max_seq_len: int, kv_cap_tokens: int | None, page_size: int,
 ) -> int:
     """KV pages worth capping the plan at, in pages of ``page_size`` tokens: the smaller of
-    what the request limits address (``max_running_req x max_seq_len``) and
-    ``kv_cap_tokens`` (None -> the default above, 0 or less -> off)."""
+    what the request limits address (``max_running_req x max_seq_len``) and ``kv_cap_tokens``
+    (0 or less -> off)."""
     tokens = max_running_req * max_seq_len
-    cap = DEFAULT_MPS_KV_CAP_TOKENS if kv_cap_tokens is None else kv_cap_tokens
+    # A default of a flat 65536 made a prompt longer than that unservable whatever the box
+    # had free, which on a 262144-context model is most of the context window. One request's
+    # full context is the real floor under the ceiling; concurrency past it still pays.
+    cap = max(DEFAULT_MPS_KV_CAP_TOKENS, max_seq_len) if kv_cap_tokens is None else kv_cap_tokens
     if cap > 0:
         tokens = min(tokens, cap)
     return max(div_ceil(tokens, page_size), 1)
