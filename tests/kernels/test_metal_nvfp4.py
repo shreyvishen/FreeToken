@@ -154,6 +154,70 @@ def test_prefill_grouped():
     assert rel(idle, moe_ref(x, gu, dn, weights, ids)) < 1e-2
 
 
+def _ragged(m, experts, top_k, seed):
+    """Routing whose run lengths span the tile: expert 0 takes every token, expert 1 exactly
+    one route, and the last expert none. The rest come from experts 2..E-2, distinct per row."""
+    g = torch.Generator().manual_seed(seed)
+    pool = torch.arange(2, experts - 1)
+    rest = [pool[torch.randperm(pool.numel(), generator=g)[: top_k - 1]] for _ in range(m)]
+    ids = torch.cat([torch.zeros(m, 1, dtype=torch.long), torch.stack(rest).view(m, -1)], 1)
+    ids[0, 1:2] = 1
+    w = torch.rand(m, top_k, generator=g)
+    return ids.int(), w / w.sum(-1, keepdim=True)
+
+
+@pytest.mark.parametrize("m", (128, 512))
+def test_prefill_tiled(m):
+    # m straddles _TILED_MIN_M: 128 keeps the row-grouped kernel, 512 takes the tiled GEMM.
+    # H 80 / I 48 also puts a K tail and a partial output tile in the tiled path, since
+    # neither divides its NK 32 / NR0 64.
+    for h, inter in SHAPES:
+        x, gu, dn, ids, weights, args = _moe_args(8, 4, m, h, inter, seed=13)
+        got = moe_prefill_nvfp4_grouped(*args)
+        assert got.shape == (m, h)
+        # The tiled gate/up GEMM stages activations as bfloat16, so a float32 x costs that
+        # much; the engine's x is a widened bfloat16 residual and is exact (see below).
+        err = rel_norm(got, moe_ref(x, gu, dn, weights, ids))
+        assert err < 1e-2, f"m={m} h={h} inter={inter}: rel_norm {err:.3e}"
+        # and against the kernel it replaces, which the predicate still reaches. Naming
+        # group_rows always lands there, so below the threshold the two agree bit for bit
+        # and above it they cannot: that is what proves the predicate routed.
+        rows = moe_prefill_nvfp4_grouped(*args, group_rows=2)
+        assert rel_norm(got, rows.cpu()) < 1e-2
+        assert torch.equal(got.cpu(), rows.cpu()) == (m < 256)
+
+
+def test_prefill_tiled_matches_the_grouped_kernel_on_the_engines_input():
+    # The MoE layer widens a bfloat16 residual to float32 before the call, so the tiled
+    # gate/up GEMM's bfloat activation tile rounds nothing and only the K order differs.
+    # Measured 1.3e-7 to 2.5e-7 here, against 1.5e-3 to 1.9e-3 for an x off that grid.
+    for h, inter in SHAPES:
+        _, _, _, _, _, args = _moe_args(8, 4, 512, h, inter, seed=17)
+        args[0] = args[0].to(torch.bfloat16).float()
+        err = rel_norm(moe_prefill_nvfp4_grouped(*args),
+                       moe_prefill_nvfp4_grouped(*args, group_rows=2).cpu())
+        assert err < 1e-6, f"h={h} inter={inter}: rel_norm {err:.3e}"
+
+
+def test_prefill_tiled_ragged_routing():
+    # One expert with every token, one with a single route, one with none, and a top_k
+    # reduction over all of them: the run bounds are what the route tile clamps against.
+    for h, inter in SHAPES:
+        for top_k in (1, 4):
+            experts = 8
+            gu = banks(experts, 2 * inter, h, seed=51)
+            dn = banks(experts, h, inter, seed=52)
+            x = torch.randn(512, h, generator=torch.Generator().manual_seed(53))
+            ids, weights = _ragged(512, experts, top_k, seed=54)
+            counts = torch.bincount(ids.reshape(-1), minlength=experts)
+            assert counts[0] == 512 and counts[experts - 1] == 0
+            assert top_k == 1 or counts[1] == 1
+            got = moe_prefill_nvfp4_grouped(x.to("mps"), *_mps(*gu), *_mps(*dn),
+                                            weights.to("mps"), ids.to("mps"))
+            err = rel_norm(got, moe_ref(x, gu, dn, weights, ids))
+            assert err < 1e-2, f"h={h} inter={inter} top_k={top_k}: rel_norm {err:.3e}"
+
+
 def test_shape_contract_is_refused_not_silently_wrong():
     packed, scale, glob = banks(1, 33, 32, seed=69)
     dense = _mps(packed[0], scale[0], glob[0])

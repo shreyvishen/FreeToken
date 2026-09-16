@@ -19,54 +19,44 @@ the 35B row's expert set (15 GiB) ends up served from memory on this 36 GiB box;
 
 ## Prefill -- M4 Max, 35B NVFP4 resident (16 Sep 2026)
 
-Prefill tok/s is `(prompt_tokens(N) - prompt_tokens(base)) / (median t(N) - median t(base))` with
-every request `max_tokens=1` and `temperature=0`, three repetitions, the median taken, and a fresh
-salt per repetition so nothing is served from a cache. Subtracting a 14-token baseline removes the
-HTTP hop, the template and the one decode step. This is the analogue of `llama-bench`'s `pN` row,
-which also times prompt processing alone. Median of 3, AC power, idle machine.
+Prefill tok/s is `(prompt_tokens(N) - prompt_tokens(base)) / (median t(N) - median t(base))`, every
+request `max_tokens=1` and `temperature=0`, five repetitions with a fresh salt each so nothing is
+served from a cache, one server process per column, AC power and an idle machine. Token counts are
+chosen to match `llama-bench`'s `pN` rows, which time prompt processing alone.
 
-| Prompt tokens | SDPA per request (before) | Tiled kernel | Tiled kernel + prefix cache |
+| Test | Tokens | Before (SDPA prefill, grouped MoE) | After | Speedup |
+|---|---|---|---|---|
+| pp512 | 516 | 694.1 (669.9-696.4) | **906.3** (871.0-912.6) | 1.31x |
+| pp2048 | 2,053 | 558.3 (556.5-564.7) | **870.0** (864.7-898.4) | 1.56x |
+| pp8192 | 8,192 | 153.3 (142.5-171.1) | **897.6** (849.7-899.6) | **5.86x** |
+
+Greedy ids are identical to the reference on both trees. The shape matters as much as the ratio:
+before, prefill fell 78 % from 512 to 8,192 tokens (694 -> 153); after, it is flat within 1 %
+(906 -> 898). The long-prompt collapse is gone, and with it the swap thrash -- an 8,192-token chunk
+used to allocate 4.3 GiB of fp32 attention scores per full-attention layer.
+
+Against `llama-bench` on the same machine (build 89fe242, Qwen3.5-9B Q4_K_M, 5.28 GiB, 3 reps):
+
+| Test | FreeToken, 35B-A3B NVFP4 | llama.cpp, 9B Q4_K_M | ratio |
 |---|---|---|---|
-| 722 | 627.7 | **691.2** | 499.2 |
-| 2,873 | 353.9 | **546.0** | 491.2 |
-| 11,474 | 96.2 | **244.7** | 225.0 |
+| pp512 | **906.3** | 663.31 +- 0.79 | 1.37x |
+| pp2048 | **870.0** | 658.10 +- 3.24 | 1.32x |
+| pp8192 | **897.6** | 612.01 +- 5.47 | 1.47x |
 
-```
-LENGTHS="512 2048 8192" bash .notes/briefs/screen_prefill.sh . 30423 prefill --cache-type naive
-```
+Different models -- a 35B-A3B MoE with 3B active against a dense 9B -- so this is not a
+like-for-like head-to-head, and llama.cpp's peak RSS is 5.72 GiB against our 26.3 GiB. It is the
+closest comparison the checkpoints on this disk allow.
 
-The middle column is `--cache-type naive`; the right-hand column is the default, which also
-snapshots GDN state for cross-request reuse (see the prefix-cache section). Greedy ids are
-identical to the SDPA path on every row, at a 6-token prompt and at a 5,613-token one.
+### Against MLX's own attention, at identical shapes
 
-The kernel wins at every length and the gain grows with the prompt, because attention is under 1 %
-of a 722-token prefill on this model (10 full-attention layers of 16 query heads at head_dim 256,
-against ~3B active MoE parameters) and about a third of a 32k one. Short-prompt prefill is bound by
-the MoE and dense GEMMs, not by attention.
-
-Memory is the larger result. Against the SDPA path at the same shapes
-(`benchmarks/bench_prefill_attention.py`, total MPS driver bytes):
-
-| q_len x kv_len | Kernel | SDPA |
-|---|---|---|
-| 2048 x 2048 | 8.20 ms, 1,051 MiB | 14.20 ms, 1,567 MiB |
-| 8192 x 8192 | 122.22 ms, 1,051 MiB | 226.30 ms, 11,419 MiB |
-| 8192 x 16384 | 371.85 ms, 1,051 MiB | 467.74 ms, 21,539 MiB |
-| 8192 x 32768 | 918.91 ms, 1,049 MiB | did not fit (~38 GiB) |
-
-The kernel's footprint is flat in kv_len and is almost entirely its inputs; the score matrix never
-exists. On the 11,474-token end-to-end row, swap peaks at 6.9 GiB against 15.3 GiB before.
-
-### Against MLX and llama.cpp on the same machine
-
-The kernel against MLX's own fused attention at identical shapes (HQ=16, HKV=2, head_dim 256,
-bf16, one request), each row in its own process:
+The tiled kernel against `mlx.core.fast.scaled_dot_product_attention` at the 35B's attention shape
+(16 query heads, 2 K/V heads, head_dim 256, bf16, one request), each row in its own process:
 
 ```
 PYTHONPATH=python:. python benchmarks/bench_prefill_attention.py --mlx
 ```
 
-| q_len x kv_len | FreeToken kernel | MLX `fast.scaled_dot_product_attention` |
+| q_len x kv_len | FreeToken kernel | MLX |
 |---|---|---|
 | 512 x 512 | **0.86 ms**, 59 MiB | 0.92 ms, 21 MiB |
 | 2048 x 2048 | 8.12 ms, 1,051 MiB | **7.62 ms**, 184 MiB |
@@ -74,31 +64,16 @@ PYTHONPATH=python:. python benchmarks/bench_prefill_attention.py --mlx
 | 8192 x 16384 | 378.51 ms, **1,051 MiB** | **248.29 ms**, 4,448 MiB |
 | 8192 x 32768 | 926.06 ms, **1,049 MiB** | **503.31 ms**, 8,704 MiB |
 
-Within 2 % of MLX through 8192 x 8192; 1.52x and 1.84x behind at 16k and 32k. Memory is the other
-way round and it widens with context: flat at ~1,050 MiB against MLX's 8,704 MiB at 32k, 8.3x less.
-MLX's peak tracks `heads x q_len x kv_len x 2 B` (8,448 MiB measured against 8,192 MiB predicted,
-and `mask=None` gives the same), so at these shapes MLX is materialising the bf16 score matrix
-rather than running a memory-flat path.
+Within 2 % of MLX through 8192 x 8192; 1.52x and 1.84x behind at 16k and 32k. Memory goes the other
+way and the gap widens with context: flat at ~1,050 MiB against MLX's 8,704 MiB at 32k, 8.3x less.
+MLX's peak tracks `heads x q_len x kv_len x 2 B` (8,448 MiB measured against 8,192 predicted, and
+`mask=None` reads the same), so at these shapes MLX materialises the bf16 score matrix rather than
+running a memory-flat path -- it buys its speed with memory we do not spend.
 
-Two things make the time column favour MLX: its K and V are contiguous while ours are gathered
-through a page table, which is about 37 % of our kernel's time by ablation, and the two memory
-columns are different counters (torch driver bytes against `mx.get_peak_memory`), so compare how
-they scale rather than their floors.
-
-llama.cpp on the same box, `llama-bench` build 89fe242, the only Qwen GGUF still on disk:
-
-| test | llama.cpp, Qwen3.5-9B Q4_K_M (5.28 GiB, 8.95 B) |
-|---|---|
-| pp512 | 663.31 +- 0.79 |
-| pp2048 | 658.10 +- 3.24 |
-| pp8192 | 612.01 +- 5.47 |
-
-Peak RSS 5.72 GiB, so about 0.44 GiB above the weights. **This is a different model and is not a
-head-to-head with the rows above.** What it does show is the shape of the curve: llama.cpp loses
-8 % from pp512 to pp8192 where FreeToken loses 65 %. Since the attention kernel is within 2 % of
-MLX to 8192 x 8192, that remaining slope is the MoE and dense GEMM path at long extend lengths, not
-attention. A same-model comparison needs the 35B GGUF and MLX checkpoints, which are not on this
-disk.
+Two caveats that favour MLX in the time column: its K and V are contiguous where ours are gathered
+through a page table, about 37 % of our kernel's time by ablation; and the two memory columns are
+different counters (torch driver bytes against `mx.get_peak_memory`), so compare how they scale
+rather than their floors.
 
 ## Prefix cache -- second-turn TTFT on a conversation (16 Sep 2026)
 
