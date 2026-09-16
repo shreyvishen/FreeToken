@@ -7,6 +7,7 @@ import functools
 
 import torch
 import torch.nn.functional as F
+from freetoken.kernel.fla.const import CHUNK_SIZE
 
 from .shaders import compile, is_available, msl_type
 
@@ -321,23 +322,52 @@ def gdn_prefill_metal(
     scale: float,
     use_kernel: bool = True,
     cu_seqlens_host: list[int] | None = None,
-) -> torch.Tensor:
-    """Varlen prefill, signature-compatible with ``gdn_prefill_chunk_fla``."""
+    return_h: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Varlen prefill, signature-compatible with ``gdn_prefill_chunk_fla``.
+
+    ``return_h`` also returns the per-chunk state the hybrid-radix track checkpoint reads
+    (``Qwen3_5GatedDeltaNet._write_track_snapshot``): ``[1, rows, Hv, Dk, Dv]`` in the pool's
+    own slot layout, one row per CHUNK_SIZE slice of every request in ``prepare_chunk_offsets``
+    order, row ``boh[i]+c`` holding the state BEFORE chunk ``c`` -- what fla's chunk_delta_h
+    stores at that row.
+    """
     run = gdn_recurrent_metal if use_kernel else gdn_recurrent_torch
     # FLAMetadata's host copy when the caller has it: one flush per forward, not per layer.
     bounds = cu_seqlens.tolist() if cu_seqlens_host is None else cu_seqlens_host
-    outs = []
-    for i in range(len(bounds) - 1):
-        lo, hi = int(bounds[i]), int(bounds[i + 1])
-        if hi == lo:
+    lens = [int(bounds[i + 1]) - int(bounds[i]) for i in range(len(bounds) - 1)]
+    h = None
+    if return_h:
+        rows = sum(-(-n // CHUNK_SIZE) for n in lens)
+        h = torch.empty((1, rows, *state_source.shape[1:]), dtype=state_source.dtype,
+                        device=state_source.device)
+    outs, row = [], 0
+    for i, n in enumerate(lens):
+        if n == 0:
             continue
-        outs.append(
-            run(
-                q[:, lo:hi], k[:, lo:hi], v[:, lo:hi], g[:, lo:hi], beta[:, lo:hi],
-                state_source=state_source, indices=indices[i : i + 1], scale=scale,
-            )[0]
-        )
-    return torch.cat(outs, dim=0)  # [total, Hv, Dv]
+        lo = int(bounds[i])
+        slot = indices[i : i + 1]
+        if h is None:
+            spans = ((lo, lo + n),)
+        else:
+            # The kernel keeps the state in registers across its whole T and writes it back
+            # once, so slicing at CHUNK_SIZE only adds the boundary round trips h needs.
+            spans = tuple((c, min(c + CHUNK_SIZE, lo + n)) for c in range(lo, lo + n, CHUNK_SIZE))
+            src = slot.long()
+        for a, b in spans:
+            if h is not None:
+                # copy_ into the row, not index_select(out=): under MPS the latter ignores the
+                # out view's storage offset and writes row 0 (torch 2.10).
+                h[0, row : row + 1].copy_(state_source.index_select(0, src))
+                row += 1
+            outs.append(
+                run(
+                    q[:, a:b], k[:, a:b], v[:, a:b], g[:, a:b], beta[:, a:b],
+                    state_source=state_source, indices=slot, scale=scale,
+                )[0]
+            )
+    out = torch.cat(outs, dim=0)  # [total, Hv, Dv]
+    return (out, h) if return_h else out
 
 
 # --- the whole decode step of one GDN layer as one launch --------------------

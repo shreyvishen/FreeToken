@@ -403,19 +403,13 @@ def dataclasses_replace_groups(mc, groups):
 
 
 def test_linear_attention_defaults_to_hybrid_radix(monkeypatch):
+    """Both trees: gdn_prefill_metal emits the per-chunk state on Metal too, so the default
+    no longer depends on the device. --cache-type naive stays the opt-out."""
     from freetoken.engine import engine
     from freetoken.engine.engine import _resolve_cache_type
 
-    monkeypatch.setattr(engine, "is_mps", lambda: False)  # CUDA tree
-    assert _resolve_cache_type(True, "radix") == "hybrid_radix"
-    assert _resolve_cache_type(True, "naive") == "naive"
-
-
-def test_linear_attention_falls_back_to_naive_on_mps(monkeypatch):
-    """No per-chunk GDN state on Metal, so no hybrid-radix snapshot to take."""
-    from freetoken.engine import engine
-    from freetoken.engine.engine import _resolve_cache_type
-
-    monkeypatch.setattr(engine, "is_mps", lambda: True)
-    assert _resolve_cache_type(True, "radix") == "naive"
-    assert _resolve_cache_type(False, "radix") == "radix"  # dense model, unaffected
+    for mps in (False, True):
+        monkeypatch.setattr(engine, "is_mps", lambda: mps)
+        assert _resolve_cache_type(True, "radix") == "hybrid_radix"
+        assert _resolve_cache_type(True, "naive") == "naive"
+        assert _resolve_cache_type(False, "radix") == "radix"  # dense model, unaffected

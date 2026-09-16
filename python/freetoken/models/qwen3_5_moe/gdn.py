@@ -113,15 +113,18 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                               h: torch.Tensor, fla) -> None:
         """Snapshot this layer's recurrent + conv state at the chunk-aligned track boundary
         into a donatable pool slot, on the forward stream (hybrid-radix extra_buffer path).
-        SSM: ``recurrent_states[li, dst] = h[0, h_row]`` -- a DIRECT copy (h is [V,K], the
-        state pool is [K,V]; they coincide because GDN requires head_k_dim == head_v_dim).
-        Conv: the last (kernel-1) raw conv-input timesteps ending at the boundary."""
+        SSM: ``recurrent_states[li, dst] = h[0, h_row]`` -- a DIRECT copy (fla's h is [V,K] and
+        the Metal h is the pool's own [K,V]; both coincide with the pool because GDN requires
+        head_k_dim == head_v_dim). Conv: the last (kernel-1) raw conv-input timesteps ending at
+        the boundary. index_put_, not index_copy_: MPS costs the latter O(destination), 131x
+        here on a 133-slot pool (kernel/metal/ops.py:store_cache)."""
         rec = pool.recurrent_states[li]
-        rec.index_copy_(0, fla.track_dst, h[0, fla.track_h_row].to(rec.dtype))
+        dst = (fla.track_dst,)
+        rec.index_put_(dst, h[0, fla.track_h_row].to(rec.dtype))
         cv = pool.conv_states[li]
         # conv_in [total, conv_dim]; gather the (kernel-1) window per tracked req.
         conv_win = conv_in[fla.track_conv_src].transpose(-1, -2).contiguous()  # [nt, conv_dim, K-1]
-        cv.index_copy_(0, fla.track_dst, conv_win.to(cv.dtype))
+        cv.index_put_(dst, conv_win.to(cv.dtype))
 
     def _metal_fp8_in_proj(self):
         """in_proj_qkvz's kernel when the fp8 table selected the Metal one, else None

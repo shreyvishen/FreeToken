@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import importlib.util
+import itertools
 import pathlib
 
 import pytest
 import torch
 
+from freetoken.kernel.fla.const import CHUNK_SIZE
 from freetoken.kernel.metal import is_available
 from freetoken.kernel.metal.gdn import (
     fused_decode_supports, gate_params_metal, gdn_decode_fused_metal, gdn_decode_metal,
-    gdn_prefill_metal, gdn_recurrent_metal,
+    gdn_prefill_metal, gdn_recurrent_metal, gdn_recurrent_torch,
 )
 from freetoken.kernel.metal.ops import rms_norm_gated
 
@@ -148,3 +150,43 @@ def test_prefill_matches_decode():
             state_source=torch.zeros(6, hv, DK, DV, device="mps"),
             indices=slots[i:i + 1], scale=DK**-0.5)[0]
         assert torch.equal(out[lo:hi], solo)
+
+
+def test_prefill_per_chunk_state():
+    """``return_h`` feeds the hybrid-radix track checkpoint: row ``boh[i] + c`` is request i's
+    state after c whole CHUNK_SIZE slices, which is what ``_write_track_snapshot`` copies into
+    the pool. Turning it on must not move the output or the state the pool keeps."""
+    hk, hv = 2, 4
+    lens = [70, 64, 200, 1]        # ragged: past a chunk, exactly a chunk, deep, single token
+    cu = list(itertools.accumulate(lens, initial=0))
+    total = cu[-1]
+    torch.manual_seed(7)
+    q, k = (torch.randn(1, total, hk, DK, device="mps") for _ in range(2))
+    v = torch.randn(1, total, hv, DV, device="mps")
+    g, beta = -torch.rand(1, total, hv, device="mps"), torch.rand(1, total, hv, device="mps")
+    slots = torch.tensor([1, 3, 5, 2], dtype=torch.int32, device="mps")
+    # non-zero start: a continuation resumes from whatever the COW-restored slot holds
+    start = torch.randn(8, hv, DK, DV, device="mps")
+    args = dict(indices=slots, cu_seqlens=torch.tensor(cu), scale=DK**-0.5)
+
+    off_state = start.clone()
+    off = gdn_prefill_metal(q, k, v, g, beta, state_source=off_state, **args)
+    on_state = start.clone()
+    out, h = gdn_prefill_metal(q, k, v, g, beta, state_source=on_state, return_h=True, **args)
+    assert torch.equal(out, off) and torch.equal(on_state, off_state)
+
+    nchunks = [-(-n // CHUNK_SIZE) for n in lens]
+    boh = list(itertools.accumulate(nchunks, initial=0))   # prepare_chunk_offsets, triton-free
+    assert h.shape == (1, boh[-1], hv, DK, DV)
+    for i, n in enumerate(lens):
+        # the deepest row is the only one _build_track_metadata ever asks for
+        assert (n - 1) // CHUNK_SIZE == nchunks[i] - 1
+        for c in range(nchunks[i]):
+            ref = start.clone()
+            lo, hi = cu[i], cu[i] + c * CHUNK_SIZE
+            if c:
+                gdn_recurrent_torch(q[:, lo:hi], k[:, lo:hi], v[:, lo:hi], g[:, lo:hi],
+                                    beta[:, lo:hi], state_source=ref, indices=slots[i:i + 1],
+                                    scale=DK**-0.5)
+            err = (h[0, boh[i] + c] - ref[int(slots[i])]).abs().max().item()
+            assert err < 1e-5, f"request {i} chunk {c}: {err}"
