@@ -319,6 +319,7 @@ def test_block_topk_replays_in_a_cuda_graph():
         torch.testing.assert_close(blocks.sort(-1).values, expected.sort(-1).values)
 
 
+@requires_cuda  # the unset branch resolves the in-repo Triton kernel, which needs triton
 def test_torch_topk_env_picks_the_fallback(monkeypatch):
     from freetoken.attention.qsa_sparse import TORCH_TOPK_ENV, _resolve_block_topk
 

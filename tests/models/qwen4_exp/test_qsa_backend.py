@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from .common import Fixture, requires_cuda, parsed_config, selection_spy
+from .common import DEVICE, Fixture, requires_cuda, requires_gpu, requires_mps, parsed_config, selection_spy
 
 QSA_LAYER = 3
 
@@ -41,7 +41,7 @@ def _assert_selection_is_causal_prefix(indices: torch.Tensor, positions: torch.T
         ), f"row {row} (position {position}) did not select its whole causal prefix"
 
 
-@requires_cuda
+@requires_gpu
 def test_prefill_is_dense_below_the_budget(monkeypatch):
     """bs=3 ragged prefill, longest request exactly at budget + ratio - 1."""
     config = parsed_config()
@@ -52,14 +52,20 @@ def test_prefill_is_dense_below_the_budget(monkeypatch):
     x = torch.cat([row[:n] for row, n in zip(inputs, lengths)])
     reqs = [fixture.req(i, 0, n) for i, n in enumerate(lengths)]
 
-    seen = selection_spy(monkeypatch, fixture.backend)
     batch = fixture.batch(reqs, "prefill")
-    got = attn.forward(x, batch)
+    got = attn.forward(x, batch)  # whatever route the backend picks for this batch
+
+    # Metal skips the selection on a dense batch, so force the sparse route (it rewrites the same K/V rows)
+    seen = selection_spy(monkeypatch, fixture.backend)
+    if hasattr(fixture.backend, "_qsa_is_dense"):
+        monkeypatch.setattr(type(fixture.backend), "_qsa_is_dense", lambda self, md: False)
+    sparse = attn.forward(x, batch)
     _assert_selection_is_causal_prefix(seen["indices"], batch.positions)
 
     fixture.ctx.attn_backend = _dense_oracle(fixture)
     reference = attn.forward(x, batch)
     torch.testing.assert_close(got.float(), reference.float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(sparse.float(), reference.float(), rtol=2e-2, atol=2e-2)
 
 
 def _dense_oracle(fixture: Fixture):
@@ -74,7 +80,7 @@ def _dense_oracle(fixture: Fixture):
     )
 
 
-@requires_cuda
+@requires_gpu
 def test_decode_is_dense_below_the_budget(monkeypatch):
     """Prefill then five decode steps, sparse path vs the fp32 dense oracle."""
     config = parsed_config()
@@ -97,14 +103,17 @@ def test_decode_is_dense_below_the_budget(monkeypatch):
                 fixture.step(req)
         batch = fixture.batch(reqs, "prefill" if step == 0 else "decode")
         fixture.ctx.attn_backend = fixture.backend
+        seen.pop("indices", None)
         got = attn.forward(x, batch)
-        _assert_selection_is_causal_prefix(seen["indices"], batch.positions)
+        # Metal skips the selection on a dense prefill; test_prefill_is_dense_below_the_budget pins it
+        if step or not hasattr(fixture.backend, "_qsa_is_dense"):
+            _assert_selection_is_causal_prefix(seen["indices"], batch.positions)
         fixture.ctx.attn_backend = oracle
         reference = attn.forward(x, batch)
         torch.testing.assert_close(got.float(), reference.float(), rtol=2e-2, atol=2e-2)
 
 
-@requires_cuda
+@requires_gpu
 def test_flashinfer_dense_matches_the_sparse_path():
     """The engine's dense FULL backend over the same pool, as an independent oracle."""
     pytest.importorskip("flashinfer")
@@ -130,7 +139,7 @@ def test_flashinfer_dense_matches_the_sparse_path():
     torch.testing.assert_close(got.float(), reference.float(), rtol=2e-2, atol=2e-2)
 
 
-@requires_cuda
+@requires_gpu
 @pytest.mark.parametrize("cut", [1001, 4096, 4097], ids=["unaligned", "page-boundary", "boundary+1"])
 def test_chunked_prefill_matches_one_shot(cut: int):
     """Cut points that are not multiples of index_ratio exercise the dual-source compress."""
@@ -150,6 +159,7 @@ def test_chunked_prefill_matches_one_shot(cut: int):
 
 @requires_cuda
 def test_decode_graph_replay_matches_eager():
+    """CUDA graphs only; test_decode_tape_replay_matches_eager_across_the_budget is the MPS twin."""
     config = parsed_config()
     fixture = Fixture(config, num_pages=256)
     attn = fixture.layer(QSA_LAYER)
@@ -203,9 +213,10 @@ def test_decode_graph_replay_matches_eager():
         assert torch.equal(replayed, eager), f"graph replay diverged at decode step {step}"
 
 
-@requires_cuda
+@requires_gpu
 def test_row_chunked_scoring_matches_one_chunk(monkeypatch):
     """The scoring workspace bound splits long prefills into row chunks."""
+    import freetoken.attention.metal as metal
     import freetoken.attention.qsa_sparse as qsa_sparse
 
     config = parsed_config()
@@ -216,12 +227,13 @@ def test_row_chunked_scoring_matches_one_chunk(monkeypatch):
     whole = attn.forward(x, fixture.batch([fixture.req(0, 0, length)], "prefill"))
 
     columns = fixture.page_table.shape[1] // config.qwen4_args.index_ratio
-    monkeypatch.setattr(qsa_sparse, "_LOGITS_WORKSPACE_BYTES", 64 * columns * 4)
+    module = metal if DEVICE == "mps" else qsa_sparse
+    monkeypatch.setattr(module, "_LOGITS_WORKSPACE_BYTES", 64 * columns * 4)
     chunked = attn.forward(x, fixture.batch([fixture.req(1, 0, length)], "prefill"))
     assert torch.equal(chunked, whole)
 
 
-@requires_cuda
+@requires_gpu
 def test_two_qsa_layers_keep_separate_slab_slots(monkeypatch):
     """Both QSA layers of one forward must hit their own slab slot and ring slice."""
     config = parsed_config(num_layers=8)
@@ -249,3 +261,141 @@ def test_two_qsa_layers_keep_separate_slab_slots(monkeypatch):
 
     slab = fixture.pool.cmp_k_cache
     assert not torch.equal(slab(0), slab(1))
+
+
+def _indexer_inputs(config, rows: int, device, dtype, generator):
+    from freetoken.models.qwen4_exp.attention import QSAIndexerInputs
+
+    args = config.qwen4_args
+    shape = (rows, args.index_n_heads, args.index_head_dim)
+    return QSAIndexerInputs(
+        q=torch.randn(shape, device=device, dtype=dtype, generator=generator),
+        k=torch.randn(rows, args.index_head_dim, device=device, dtype=dtype,
+                      generator=generator),
+        q_norm_weight=torch.randn(args.index_head_dim, device=device, dtype=dtype,
+                                  generator=generator) * 0.1,
+        k_norm_weight=torch.randn(args.index_head_dim, device=device, dtype=dtype,
+                                  generator=generator) * 0.1,
+        eps=config.rms_norm_eps,
+    )
+
+
+@requires_mps
+@torch.inference_mode()  # DecodeTape.record allocates inference tensors, as the engine does
+def test_decode_tape_replay_matches_eager_across_the_budget():
+    """Replay one recorded decode step from kv_len 2040 past 2051: a tape that read kv_len on the host stays dense."""
+    from freetoken.engine.mps_tape import DecodeTape
+    from freetoken.models.qwen4_exp.attention import QSAIndexerInputs
+
+    config = parsed_config()
+    args = config.qwen4_args
+    fixture, bs, steps = Fixture(config, num_pages=160), 1, 32
+    backend, device, dtype = fixture.backend, fixture.device, fixture.dtype
+    heads, dim, kv_dim = config.num_qo_heads, config.head_dim, config.num_kv_heads * config.head_dim
+    generator = torch.Generator(device=device).manual_seed(19)
+
+    def step_inputs(rows: int):
+        q = torch.randn(rows, heads, dim, device=device, dtype=dtype, generator=generator)
+        k = torch.randn(rows, kv_dim, device=device, dtype=dtype, generator=generator)
+        v = torch.randn(rows, kv_dim, device=device, dtype=dtype, generator=generator)
+        return q, k, v
+
+    # Prefill to just under the dense threshold, so the sweep below crosses it.
+    prefill_len = 2040
+    req = fixture.req(0, 0, prefill_len)
+    index = _indexer_inputs(config, prefill_len, device, dtype, generator)
+    backend.qsa_forward(*step_inputs(prefill_len), index, QSA_LAYER,
+                        fixture.batch([req], "prefill"))
+
+    backend.init_capture_graph(max_seq_len=fixture.page_table.shape[1], bs_list=[bs])
+    dummy_slot = fixture.num_req_slots - 1
+    static = {
+        "q": torch.zeros(bs, heads, dim, device=device, dtype=dtype),
+        "k": torch.zeros(bs, kv_dim, device=device, dtype=dtype),
+        "v": torch.zeros(bs, kv_dim, device=device, dtype=dtype),
+        "iq": torch.zeros(bs, args.index_n_heads, args.index_head_dim, device=device,
+                          dtype=dtype),
+        "ik": torch.zeros(bs, args.index_head_dim, device=device, dtype=dtype),
+        "out_loc": torch.full((bs,), int(fixture.page_table[dummy_slot, 0]),
+                              dtype=torch.int32, device=device),
+    }
+    static_index = QSAIndexerInputs(
+        q=static["iq"], k=static["ik"], q_norm_weight=index.q_norm_weight,
+        k_norm_weight=index.k_norm_weight, eps=index.eps,
+    )
+    dummy = SimpleNamespace(table_idx=dummy_slot, cached_len=1, device_len=2, extend_len=1)
+    capture_batch = SimpleNamespace(
+        padded_reqs=[dummy] * bs, reqs=[dummy] * bs, phase="decode", size=bs, padded_size=bs,
+        is_prefill=False, is_decode=True, out_loc=static["out_loc"], attn_metadata=None,
+    )
+    backend.prepare_for_capture(capture_batch)
+    captured = backend.qsa_forward(
+        static["q"], static["k"], static["v"], static_index, QSA_LAYER, capture_batch
+    ).clone()  # warm: shaders compiled, scratch sized
+
+    def one_step():
+        captured.copy_(
+            backend.qsa_forward(
+                static["q"], static["k"], static["v"], static_index, QSA_LAYER, capture_batch
+            )
+        )
+
+    tape = DecodeTape.record(one_step)
+    assert len(tape), "the recorded decode forward issued no launches"
+
+    # The replayed selection, read off the scratch the expansion kernel writes. If
+    # torch.topk(..., out=) were NOT recorded, every replay would expand the block set the
+    # capture batch chose and this would be one constant.
+    sel_key = ("sel", (backend._qsa_width,), torch.int32)
+    picked = []
+    for _ in range(steps):
+        fixture.step(req)
+        q, k, v = step_inputs(bs)
+        one = _indexer_inputs(config, bs, device, dtype, generator)
+        live = QSAIndexerInputs(
+            q=one.q, k=one.k, q_norm_weight=index.q_norm_weight,
+            k_norm_weight=index.k_norm_weight, eps=index.eps,
+        )
+        batch = fixture.batch([req], "decode")
+        backend.prepare_for_replay(batch)
+        for name, value in (("q", q), ("k", k), ("v", v), ("iq", one.q), ("ik", one.k)):
+            static[name].copy_(value)
+        static["out_loc"].copy_(batch.out_loc)
+        tape.replay()
+        replayed = captured.clone()
+        # the expanded blocks only, before the open group's causal tail
+        picked.append(backend._qsa_buffers[sel_key][0, : args.index_budget].clone())
+        eager = backend.qsa_forward(q, k, v, live, QSA_LAYER, batch)
+        assert torch.equal(replayed, eager), f"replay diverged at kv_len {req.device_len}"
+    assert req.device_len > args.index_budget + args.index_ratio - 1, "sweep never crossed"
+    assert any(not torch.equal(picked[0], row) for row in picked[1:]), (
+        "every replay expanded the same blocks: torch.topk(out=) is not being re-run"
+    )
+
+
+@requires_mps
+def test_a_chunked_prefill_does_not_grow_the_qsa_scratch():
+    """Chunks that keep raising the block count must not mint a QSA workspace per column count."""
+    config = parsed_config()
+    fixture = Fixture(config, num_pages=512)
+    attn = fixture.layer(QSA_LAYER)
+    backend = fixture.backend
+    chunk, chunks = 1024, 24  # block counts 256 .. 6144, crossing six powers of two
+    generator = torch.Generator(device=fixture.device).manual_seed(17)
+    x = torch.randn(
+        chunk * chunks, config.hidden_size, device=fixture.device, dtype=fixture.dtype,
+        generator=generator,
+    ) * 0.5
+
+    attn.forward(x[:chunk], fixture.batch([fixture.req(0, 0, chunk)], "prefill"))
+    torch.mps.synchronize()
+    before = torch.mps.driver_allocated_memory()
+    for step in range(1, chunks):
+        lo, hi = step * chunk, (step + 1) * chunk
+        attn.forward(x[lo:hi], fixture.batch([fixture.req(0, lo, hi)], "prefill"))
+    torch.mps.synchronize()
+    grew = torch.mps.driver_allocated_memory() - before
+
+    # The K/V the chunks themselves wrote dominates; the scratch must not add hundreds of
+    # MiB on top, which is what one logits workspace per distinct column count would do.
+    assert grew < 512 << 20, f"driver pool grew {grew / (1 << 20):.1f} MiB over {chunks} chunks"

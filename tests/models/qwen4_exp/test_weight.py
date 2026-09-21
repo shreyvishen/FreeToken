@@ -11,6 +11,7 @@ import random
 from types import SimpleNamespace
 
 import pytest
+import safetensors
 import torch
 from safetensors.torch import save_file
 
@@ -25,7 +26,10 @@ from freetoken.models.qwen4_exp.weight import (
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
 
-from .common import LM, RADIXARK_NVFP4, hf_config, install_quant_config, meta_state_dict, mixed_precision_quant
+from .common import (
+    DEVICE, LM, RADIXARK_NVFP4, hf_config, install_quant_config, meta_state_dict,
+    mixed_precision_quant, requires_gpu,
+)
 
 H = 128  # hidden_size; every block-fp8 projection needs in/out multiples of 128
 HC = 4  # hc_count
@@ -426,17 +430,53 @@ def test_every_registry_architecture_is_claimed_by_an_aot_entry():
     assert set(_MODEL_REGISTRY) - claimed == set()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs cuda")
+@requires_gpu
 def test_fusion_pad_rides_the_tensor_device():
-    """safetensors loads straight to cuda; a cpu-allocated pad row would break torch.cat."""
+    """safetensors loads straight to the GPU; a cpu-allocated pad row would break torch.cat."""
     fuser = _DenseFuser(None, get_model_spec("Qwen4ExpForConditionalGeneration").packed_modules_mapping)
-    down = torch.randn(320, 64, device="cuda", dtype=torch.bfloat16)
-    inject = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
+    down = torch.randn(320, 64, device=DEVICE, dtype=torch.bfloat16)
+    inject = torch.randn(4, 64, device=DEVICE, dtype=torch.bfloat16)
     assert fuser.fuse("model.layers.0.attn_hyper_connection.input_mix_weight_down.weight", down) == []
     [(key, fused)] = fuser.fuse("model.layers.0.attn_hyper_connection.block_inject_weight.weight", inject)
     assert key == "model.layers.0.attn_hyper_connection.input_mix_weight_down_block_inject.weight"
-    assert fused.device.type == "cuda" and fused.shape[0] == 336
-    assert torch.equal(fused[324:], torch.zeros(12, 64, device="cuda", dtype=torch.bfloat16))
+    assert fused.device.type == DEVICE and fused.shape[0] == 336
+    assert torch.equal(fused[324:], torch.zeros(12, 64, device=DEVICE, dtype=torch.bfloat16))
+
+
+def test_the_skipped_tensors_are_never_read(checkpoint, monkeypatch):
+    """The skip must happen before get_tensor: a key read and then dropped still costs its unified memory."""
+    folder, _raw = checkpoint
+    install_quant_config(folder)
+    requested: list[str] = []
+    original = safetensors.safe_open
+
+    class _Spy:  # the pyo3 handle's get_tensor is read-only, so wrap rather than patch it
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+        def __enter__(self):
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self._handle.__exit__(*exc)
+
+        def get_tensor(self, name):
+            requested.append(name)
+            return self._handle.get_tensor(name)
+
+    monkeypatch.setattr(safetensors, "safe_open", lambda *a, **kw: _Spy(original(*a, **kw)))
+    loaded = dict(iter_weights(folder, torch.device("cpu"), include_moe_experts=True,
+                               include_non_moe=True, include_vision=False))
+    assert loaded and requested
+    for raw in requested:
+        assert not raw.startswith("mtp."), raw
+        assert ".mlp.experts." not in raw, raw
+        assert "ngram_embedding" not in raw, raw
+        assert not raw.startswith("model.visual."), raw
 
 
 # ======================================================================================
@@ -457,7 +497,12 @@ FP8_MODULES = (
 )
 
 
-@pytest.mark.parametrize("fixture", ["checkpoint", "checkpoint_nvfp4", "checkpoint_fp8"])
+@pytest.mark.parametrize("fixture", [
+    "checkpoint", "checkpoint_nvfp4",
+    # only community requants carry block-fp8 dense projections; the released checkpoints keep them bf16
+    pytest.param("checkpoint_fp8", marks=pytest.mark.skipif(
+        DEVICE == "mps", reason="no Metal block-fp8 dense linear kernel")),
+])
 def test_emitted_keys_are_the_model_state_dict(fixture, request):
     """The reader fills exactly the buffers the engine builds from the same config, block-fp8 ones with the stored dtypes."""
     folder, _raw = request.getfixturevalue(fixture)

@@ -23,7 +23,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from .common import Fixture, requires_cuda, parsed_config, selection_spy
+from .common import Fixture, parsed_config, requires_cuda, requires_gpu, selection_spy
 
 QSA_LAYER = 3
 LENGTH = 3000
@@ -115,7 +115,7 @@ def _jaccard(indices, selection):
     return torch.tensor(scores)
 
 
-@requires_cuda
+@requires_gpu
 def test_single_layer_matches_hf_reference(monkeypatch):
     config = parsed_config()
     fixture = Fixture(config, num_pages=128, max_running_req=4)
@@ -187,7 +187,7 @@ torch.save({"out": out[0].cpu(), "selected": selected.cpu()}, sys.argv[2])
 '''
 
 
-@requires_cuda
+@requires_cuda  # the HF driver subprocess loads the payload onto cuda
 @pytest.mark.skipif(
     not os.environ.get("FREETOKEN_QWEN4_HF_PYTHON"),
     reason="set FREETOKEN_QWEN4_HF_PYTHON to a transformers build that ships qwen4_exp",
@@ -251,3 +251,43 @@ def test_single_layer_matches_upstream_hf(tmp_path, monkeypatch):
     jaccard = _jaccard(seen["indices"], selection)
     assert jaccard.min() >= 0.97, f"worst-row Jaccard {jaccard.min():.4f}"
     torch.testing.assert_close(got.float(), upstream["out"].float(), rtol=2e-2, atol=2e-2)
+
+
+@requires_gpu
+def test_one_decode_step_past_the_budget_matches_hf_reference(monkeypatch):
+    """A sparse decode row (one query, the pending ring in its selection; Metal's only decode path) vs the HF reference."""
+    config = parsed_config()
+    fixture = Fixture(config, num_pages=128, max_running_req=4)
+    attn = fixture.layer(QSA_LAYER)
+    generator = torch.Generator(device=fixture.device).manual_seed(23)
+    x = (
+        torch.randn(
+            LENGTH + 1, config.hidden_size, device=fixture.device, dtype=fixture.dtype,
+            generator=generator,
+        )
+        * 0.5
+    )
+    req = fixture.req(0, 0, LENGTH)
+    attn.forward(x[:LENGTH], fixture.batch([req], "prefill"))
+
+    seen = selection_spy(monkeypatch, fixture.backend)
+    fixture.step(req)
+    got = attn.forward(x[LENGTH:], fixture.batch([req], "decode"))
+    indices = seen["indices"]
+    assert indices.shape[0] == 1, indices.shape
+
+    args = config.qwen4_args
+    positions = torch.arange(LENGTH + 1, device=fixture.device, dtype=torch.int32)
+    scores = _hf_block_scores(x, attn.indexer, config, positions)
+    reference_selection = _hf_selection(
+        scores[-1:], positions[-1:], args.index_ratio, args.index_budget
+    )
+    assert reference_selection[0].numel() < LENGTH + 1, "the reference row is not sparse"
+    jaccard = _jaccard(indices, reference_selection)
+    assert jaccard.min() >= 0.97, f"worst-row Jaccard {jaccard.min():.4f}"
+
+    # One cheap token for every row the loop passes over; only the last row is read back.
+    filler = torch.zeros(1, dtype=torch.int64, device=fixture.device)
+    own = indices[0][indices[0] >= 0].long().sort().values
+    reference = _hf_layer_output(x, attn, config, positions, [filler] * LENGTH + [own])
+    torch.testing.assert_close(got.float(), reference[-1:], rtol=2e-2, atol=2e-2)

@@ -110,7 +110,8 @@ class Qwen4ExpModel(BaseOP):
 
     def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
         hidden = embed_input_ids(self.embed_tokens, input_ids, batch)
-        hidden = hidden.repeat(1, self.hc_count)
+        # expand + reshape is the same copy as repeat(1, hc_count); the mps decode tape can replay it
+        hidden = hidden.unsqueeze(1).expand(-1, self.hc_count, -1).reshape(hidden.shape[0], -1)
         meta = None
         if self._ple:
             from .ple import build_ple_metadata, commit_ngram_context

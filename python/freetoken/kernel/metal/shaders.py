@@ -24,6 +24,11 @@ inline float e4m3_u8_to_f32(uchar v) {
 """
 
 
+def ept(head_dim: int) -> int:
+    """Elements per thread when a 32-lane SIMD-group splits one ``head_dim``-wide row."""
+    return -(-head_dim // 32)
+
+
 def msl_type(dtype: torch.dtype) -> str:
     try:
         return _MSL_TYPE[dtype]
@@ -53,15 +58,6 @@ def is_available() -> bool:
 # The library comes back behind a proxy so engine/mps_tape.py can record every launch.
 _recorder = None  # callable(fn, args, kwargs) while a tape records, else None
 
-# ``torch._C._mps_MetalKernel`` carries no name and the tape stores the bare kernel, so its
-# MSL entry point is kept beside it here.
-_names: dict[int, str] = {}
-
-
-def kernel_name(fn) -> str:
-    return _names.get(id(fn), "?")
-
-
 def set_recorder(callback) -> None:
     global _recorder
     _recorder = callback
@@ -73,7 +69,6 @@ class TapedLibrary:
 
     def __getattr__(self, name):
         fn = getattr(self._lib, name)
-        _names[id(fn)] = name
 
         def kernel(*args, **kwargs):
             if _recorder is not None:

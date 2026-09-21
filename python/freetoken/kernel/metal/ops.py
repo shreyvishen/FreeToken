@@ -48,19 +48,24 @@ def apply_rope_with_cos_sin_cache_inplace(
 
 
 def rmsnorm(
-    input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6, out=None, enable_pdl=False
+    input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6, out=None, enable_pdl=False,
+    plus_one: bool = False,
 ) -> torch.Tensor:
     """``x * rsqrt(mean(x^2) + eps) * w`` in fp32, cast back."""
     from .norm import rmsnorm_metal, supports
 
     if supports(input, weight):
-        return rmsnorm_metal(input, weight, eps, out)
-    return _rmsnorm_torch(input, weight, eps, out)
+        return rmsnorm_metal(input, weight, eps, out, plus_one=plus_one)
+    return _rmsnorm_torch(input, weight, eps, out, plus_one)
 
 
-def _rmsnorm_torch(input: torch.Tensor, weight: torch.Tensor, eps: float, out=None):
+def _rmsnorm_torch(input: torch.Tensor, weight: torch.Tensor, eps: float, out=None,
+                   plus_one: bool = False):
     x = input.float()
-    y = (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight.float()).to(input.dtype)
+    w = weight.float()
+    if plus_one:
+        w = w + 1.0
+    y = (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w).to(input.dtype)
     if out is not None:
         out.copy_(y)
         return out
@@ -69,36 +74,54 @@ def _rmsnorm_torch(input: torch.Tensor, weight: torch.Tensor, eps: float, out=No
 
 def fused_add_rmsnorm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
-    eps: float = 1e-6, enable_pdl=False,
+    eps: float = 1e-6, enable_pdl=False, plus_one: bool = False,
 ) -> None:
     """``residual += input; input = rmsnorm(residual)``, both in place: the residual
     carries the pre-norm sum on to the next layer, so this cannot be a pure function."""
     from .norm import fused_add_rmsnorm_metal, supports
 
     if supports(input, weight) and residual.is_contiguous() and residual.dtype == input.dtype:
-        fused_add_rmsnorm_metal(input, residual, weight, eps)
+        fused_add_rmsnorm_metal(input, residual, weight, eps, plus_one=plus_one)
         return
     residual.add_(input)
-    input.copy_(_rmsnorm_torch(residual, weight, eps))
+    input.copy_(_rmsnorm_torch(residual, weight, eps, plus_one=plus_one))
+
+
+def gemma_rmsnorm(
+    input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6, out=None, enable_pdl=False
+) -> torch.Tensor:
+    """(1 + w)-scaled RMSNorm; drop-in for ``flashinfer.norm.gemma_rmsnorm``. The +1 is added
+    in fp32 at runtime, never folded into the stored bf16 weight."""
+    return rmsnorm(input, weight, eps, out, plus_one=True)
+
+
+def gemma_fused_add_rmsnorm(
+    input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+    eps: float = 1e-6, enable_pdl=False,
+) -> None:
+    """(1 + w)-scaled :func:`fused_add_rmsnorm`; drop-in for flashinfer's."""
+    fused_add_rmsnorm(input, residual, weight, eps, plus_one=True)
 
 
 def rms_norm_gated(
     x: torch.Tensor, weight: torch.Tensor, bias, z: torch.Tensor, eps: float,
     is_rms_norm: bool = True, norm_before_gate: bool = True, activation: str = "silu",
 ) -> torch.Tensor:
-    """``norm(x) * silu(z)``, the GDN output gate."""
-    if not is_rms_norm or not norm_before_gate or activation != "silu":
-        raise NotImplementedError("metal rms_norm_gated: rms + norm_before_gate + silu only")
+    """``norm(x) * act(z)``, the GDN output gate; ``act`` is silu/swish or sigmoid."""
+    silu = activation in ("silu", "swish")
+    if (bias is not None or not is_rms_norm or not norm_before_gate
+            or not (silu or activation == "sigmoid")):
+        raise NotImplementedError(
+            "metal rms_norm_gated: no bias, rms + norm_before_gate + silu/swish/sigmoid only"
+        )
     from .norm import rms_norm_gated_metal, supports
 
-    if (supports(x, weight) and z.is_contiguous() and z.dtype == x.dtype
-            and (bias is None or (bias.dtype == x.dtype and bias.is_contiguous()))):
-        return rms_norm_gated_metal(x, weight, bias, z, eps)
+    if supports(x, weight) and z.is_contiguous() and z.dtype == x.dtype:
+        return rms_norm_gated_metal(x, weight, z, eps, gate_silu=silu)
     xf = x.float()
     y = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * weight.float()
-    if bias is not None:
-        y = y + bias.float()
-    return (y * F.silu(z.float())).to(x.dtype)
+    gate = F.silu(z.float()) if silu else torch.sigmoid(z.float())
+    return (y * gate).to(x.dtype)
 
 
 def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
@@ -155,22 +178,9 @@ def fused_topk_softmax(
 
     if gating_output.device.type == "mps" and supports(gating_output, topk):
         return fused_topk_softmax_metal(gating_output, topk, renormalize, num_token_non_padded)
-    return _topk_softmax_torch(gating_output, topk, renormalize, num_token_non_padded)
+    from freetoken.moe.fused import _torch_fused_topk
 
-
-def _topk_softmax_torch(
-    gating_output: torch.Tensor, topk: int, renormalize: bool,
-    num_token_non_padded: torch.Tensor | None = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    probs = torch.softmax(gating_output.float(), dim=-1)
-    weights, indices = torch.topk(probs, topk, dim=-1)
-    if renormalize:
-        weights = weights / weights.sum(-1, keepdim=True)
-    indices = indices.to(torch.int32)
-    if num_token_non_padded is not None:
-        rows = torch.arange(indices.shape[0], device=indices.device)
-        indices[rows >= num_token_non_padded, :] = -1
-    return weights.contiguous(), indices.contiguous()
+    return _torch_fused_topk(gating_output, topk, renormalize, num_token_non_padded)
 
 
 def causal_conv1d_decode(
@@ -224,6 +234,7 @@ def causal_conv1d_varlen(
 
 __all__ = [
     "apply_rope_with_cos_sin_cache_inplace", "silu_and_mul", "causal_conv1d_decode",
-    "causal_conv1d_varlen", "_topk_softmax_torch", "fused_add_rmsnorm", "fused_topk_softmax",
-    "indexing", "rms_norm_gated", "rmsnorm", "store_cache",
+    "causal_conv1d_varlen", "fused_add_rmsnorm", "fused_topk_softmax",
+    "gemma_fused_add_rmsnorm", "gemma_rmsnorm", "indexing", "rms_norm_gated", "rmsnorm",
+    "store_cache",
 ]

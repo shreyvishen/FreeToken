@@ -17,7 +17,19 @@ def gdn_prefill_chunk_fla(
     return_h: bool = False,
     cu_seqlens_host: list | None = None,
 ) -> torch.Tensor:
-    """Chunked gated-delta-rule prefill via the vendored fla kernel."""
+    """Chunked gated-delta-rule prefill via the vendored fla kernel. GQA is handled
+    in-kernel (q/k at num_k_heads), q/k l2norm is done in-kernel, and the per-sequence
+    recurrent state is read from and written back to ``state_source[indices]`` IN PLACE
+    (no external l2norm, no Python stack of initial states, no copy_ writeback loop).
+    Fresh sequences must have their ``state_source`` slot pre-zeroed by the caller.
+    Returns ``o`` of shape ``[total, num_v_heads, head_v_dim]`` (bf16).
+
+    When ``return_h=True`` also returns the per-chunk hidden-state buffer ``h`` of shape
+    ``[1, NT_total, num_v_heads, head_v_dim, head_k_dim]`` (bf16). ``h[0, boh_i + c]`` is the
+    recurrent state after ``c*64`` tokens of packed sequence ``i`` (chunk granularity 64), where
+    ``boh_i = prepare_chunk_offsets(cu_seqlens, 64)[i]``. Note the last two dims are ``[V, K]`` --
+    transposed vs ``state_source``'s ``[K, V]``. Used by the hybrid-radix track-checkpoint path."""
+    # gdn_prefill_metal takes the same arguments but returns h in the pool's layout (its docstring).
     if q.device.type == "mps":
         from freetoken.kernel.metal.gdn import gdn_prefill_metal
 
@@ -80,9 +92,11 @@ def gdn_decode_fused(
     mixed: torch.Tensor, z: torch.Tensor, a: torch.Tensor, b: torch.Tensor, *, A_log: torch.Tensor,
     dt_bias: torch.Tensor, norm_weight: torch.Tensor, norm_eps: float, state_source: torch.Tensor,
     indices: torch.Tensor, scale: float, num_k_heads: int, head_k_dim: int,
+    activation: str = "silu",
 ):
     """The whole GDN decode step after the conv (mixed: [B, conv_dim] q|k|v), in one Metal
-    launch: q/k l2 norms, gating, recurrent update, gated output RMSNorm."""
+    launch: q/k l2 norms, gating, recurrent update, gated output RMSNorm. ``activation`` is
+    the output gate's, and must be the one ``GatedRMSNorm`` would have applied."""
     if mixed.device.type != "mps":
         return None
     from freetoken.kernel.metal.gdn import fused_decode_supports, gdn_decode_fused_metal
@@ -90,13 +104,13 @@ def gdn_decode_fused(
     hv, dv = state_source.shape[1], state_source.shape[3]
     if not fused_decode_supports(
         mixed, z, a, b, A_log, dt_bias, norm_weight, state_source,
-        num_k_heads, hv, head_k_dim, dv,
+        num_k_heads, hv, head_k_dim, dv, activation,
     ):
         return None
     return gdn_decode_fused_metal(
         mixed, z, a, b, A_log=A_log, dt_bias=dt_bias, norm_weight=norm_weight,
         norm_eps=norm_eps, state_source=state_source, indices=indices,
-        scale=scale, num_k_heads=num_k_heads, head_k_dim=head_k_dim,
+        scale=scale, num_k_heads=num_k_heads, head_k_dim=head_k_dim, activation=activation,
     )
 
 

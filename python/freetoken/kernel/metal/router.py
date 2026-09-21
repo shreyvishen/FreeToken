@@ -123,9 +123,8 @@ kernel void router_topk(
 }}
 """
 
-# One simdgroup instead of eight, for a row that fits in V = ceil(E / 32) registers per
-# lane: simd_max/simd_sum/simd_shuffle_down are barrier-free, so the K argmax passes pay
-# no threadgroup barrier and the row never touches threadgroup memory.
+# One simdgroup instead of eight when a row fits V = ceil(E / 32) registers per lane: the simd_*
+# reductions need no barrier, so the K argmax passes never touch threadgroup memory.
 _SIMD_SOURCE = r"""
 #include <metal_stdlib>
 using namespace metal;
@@ -169,7 +168,9 @@ kernel void router_topk(
   int sel_i[K];
   for (uint kk = 0; kk < K; ++kk) {{
     float bv = -INFINITY;
-    int bi = int(E);
+    // 0, not E: a row that is entirely -inf or NaN beats nothing, and an id of E would be
+    // gathered out of bounds by the expert path. The threadgroup kernel above starts at 0 too.
+    int bi = 0;
     #pragma unroll
     for (uint j = 0; j < V; ++j) {{
       int i = int(lane + 32u * j);

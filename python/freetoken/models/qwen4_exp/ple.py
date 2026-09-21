@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, List, Protocol, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
+from freetoken.kernel import backend as device_backend
 from freetoken.layers import BaseOP, LinearReplicated
 from freetoken.mm import restore_placeholder
 
@@ -58,11 +59,16 @@ class PLETableBackend(Protocol):
 
     ``prefetch`` may start the gather early on a side stream (the model issues it before layer 0 and
     joins it in ``lookup``); a backend with no async path makes it a no-op.
+
+    A backend that sets ``hashes_on_host`` has already staged this dispatch's rows in batch order
+    (``forward_host_ctx``), so ``lookup`` reads only the SHAPE of ``row_ids`` and the layer hands it
+    an uninitialized tensor instead of hashing on the device.
     """
 
     num_rows: int
     head_dim: int
     dtype: torch.dtype
+    hashes_on_host: bool = False
 
     def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor: ...
 
@@ -103,6 +109,9 @@ class ZeroTable:
         self.num_rows = int(num_rows)
         self.head_dim = head_dim
         self.dtype = dtype
+        # The lookup never reads the ids, so on Metal -- where the device hash is not
+        # recordable -- this table wants them hashed on the host, like the disk table.
+        self.hashes_on_host = device_backend.is_mps()
 
     def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
         if out is not None:
@@ -138,6 +147,10 @@ class PinnedUVATable:
         device: torch.device | None = None,
         prefetch: bool = True,
     ) -> None:
+        assert not device_backend.is_mps(), (
+            "PinnedUVATable gathers over UVA with a Triton kernel; Metal serves the table with "
+            "--ple-backend disk"
+        )
         assert weight.device.type == "cpu" and weight.is_contiguous()
         assert weight.dtype in (torch.float8_e4m3fn, torch.bfloat16), weight.dtype
         from freetoken.kernel.pinned import device_ptr
@@ -344,7 +357,12 @@ def build_ple_metadata(
         bs = slots.numel()
         return PLEMetadata(
             input_ids=input_ids,
-            cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device),
+            # the scheduler's own decode indptr, which graph.py keeps on a persistent buffer; only
+            # the prefill branches read it, and a fresh arange here has no decode-tape replay form
+            cu_seqlens=(
+                fla.cu_seqlens if fla is not None
+                else torch.arange(bs + 1, dtype=torch.int32, device=device)
+            ),
             seq_lens=(1,) * bs,
             ngram_context=context_pool.index_select(0, slots).long(),
             state_slots=slots,
@@ -359,9 +377,14 @@ def build_ple_metadata(
         fresh = ~fla.has_initial_state
     else:  # direct-op callers (tests) with no scheduler metadata
         pin = {"device": "cpu", "pin_memory": torch.cuda.is_available()}
-        cu = torch.tensor([0, *lens], dtype=torch.int64, **pin).cumsum_(0).to(device, non_blocking=True)
-        slots = torch.tensor([_state_slot(r) for r in reqs], dtype=torch.int64, **pin).to(device, non_blocking=True)
-        fresh = torch.tensor([r.cached_len == 0 for r in reqs], dtype=torch.bool, **pin).to(device, non_blocking=True)
+        host = [
+            torch.tensor([0, *lens], dtype=torch.int64, **pin).cumsum_(0),
+            torch.tensor([_state_slot(r) for r in reqs], dtype=torch.int64, **pin),
+            torch.tensor([r.cached_len == 0 for r in reqs], dtype=torch.bool, **pin),
+        ]
+        # stage_h2d, not a bare non_blocking: on Metal the source is unpinned and an async copy
+        # reads freed memory once the host tensor dies
+        cu, slots, fresh = [t.to(device, non_blocking=device_backend.stage_h2d(t)) for t in host]
     context = context_pool.index_select(0, slots).long()
     context = torch.where(fresh.unsqueeze(1), context.new_full((), eos), context)
     return PLEMetadata(
@@ -386,10 +409,13 @@ def commit_ngram_context(meta: PLEMetadata, fla, context_pool: torch.Tensor | No
         context_pool = _ngram_context_pool()
     ids = meta.input_ids.long()
     ctx_len = meta.ngram_context.shape[1]
-    steps = torch.arange(ctx_len, device=ids.device)
     if meta.is_decode:
-        nxt = torch.cat([meta.ngram_context[:, 1:], ids.view(-1, 1)], dim=1)
+        # out=, and no arange unless a branch below needs one: this runs inside the recorded
+        # MPS decode forward, where a bare cat or arange has no replay form
+        nxt = torch.empty_like(meta.ngram_context)
+        torch.cat([meta.ngram_context[:, 1:], ids.view(-1, 1)], dim=1, out=nxt)
     else:
+        steps = torch.arange(ctx_len, device=ids.device)
         cu = meta.cu_seqlens.long()
         cand = cu[1:].unsqueeze(1) - ctx_len + steps
         # short extends fall back to the old context: token j of the new window sits at
@@ -398,10 +424,12 @@ def commit_ngram_context(meta: PLEMetadata, fla, context_pool: torch.Tensor | No
             1, ((cu[1:] - cu[:-1]).unsqueeze(1) + steps).clamp_(max=ctx_len - 1)
         )
         nxt = torch.where(cand >= cu[:-1].unsqueeze(1), ids[cand.clamp_min(0)], old)
-    context_pool.index_copy_(0, meta.state_slots, nxt.to(context_pool.dtype))
+    # index_put_, not index_copy_ (O(destination) on MPS); a repeated padding slot is harmless
+    context_pool.index_put_((meta.state_slots,), nxt.to(context_pool.dtype))
     if fla is not None and fla.track_boundary_row is not None:
+        steps = torch.arange(ctx_len, device=ids.device)
         win = ids[fla.track_boundary_row.unsqueeze(1) - ctx_len + steps]
-        context_pool.index_copy_(0, fla.track_dst, win.to(context_pool.dtype))
+        context_pool.index_put_((fla.track_dst,), win.to(context_pool.dtype))
 
 
 class NGramEmbedding(BaseOP):
@@ -482,8 +510,20 @@ class NGramEmbedding(BaseOP):
             blocks.append(head_ids + self.ngram_heads_offsets[start:end])
         return torch.cat(blocks, dim=-1)
 
+    def lookup_ids(self, meta: PLEMetadata) -> torch.Tensor:
+        """What ``table.lookup`` is addressed with: the hashed ids, or a bare ``[T, heads]`` shape
+        when the backend hashed on the host. The device hash is ~20 launches the MPS decode tape
+        has no replay form for, and a host-hashed backend never reads their values."""
+        if getattr(self.table, "hashes_on_host", False):
+            return torch.empty(
+                (meta.input_ids.shape[0], self.num_heads),
+                dtype=torch.int64,
+                device=meta.input_ids.device,
+            )
+        return self.row_ids(meta)
+
     def forward(self, meta: PLEMetadata, out: torch.Tensor | None = None) -> torch.Tensor:
-        return self.table.lookup(self.row_ids(meta), out)
+        return self.table.lookup(self.lookup_ids(meta), out)
 
 
 class _DepthwiseConv1d(BaseOP):
@@ -578,10 +618,10 @@ class PLELayer(BaseOP):
         self._pending: Tuple[PLEMetadata, torch.Tensor] | None = None
 
     def start_prefetch(self, batch: Batch, meta: PLEMetadata | None = None) -> None:
-        """Hash this forward's n-grams and start the table gather on the side stream."""
+        """Address this forward's rows and start the table gather on the side stream."""
         if meta is None:
             meta = build_ple_metadata(batch, self.args, batch.input_ids.device)
-        row_ids = self.ple_embedding.row_ids(meta)
+        row_ids = self.ple_embedding.lookup_ids(meta)
         self._pending = (meta, row_ids)
         self.ple_embedding.table.prefetch(row_ids)
 
@@ -602,15 +642,22 @@ class PLELayer(BaseOP):
         elif pending is not None and pending[0] is meta:
             row_ids = pending[1]
         if row_ids is None:
-            row_ids = self.ple_embedding.row_ids(meta)
+            row_ids = self.ple_embedding.lookup_ids(meta)
 
         embeddings = self.ple_embedding.table.lookup(row_ids).to(R.dtype)
         key = self.norm_key.forward(self.key_proj.forward(embeddings))
         value = self.value_proj.forward(embeddings)
         query = self.norm_query.forward(R)
         shape = (-1, self.hc_count, self.hidden_size)
-        gate = (key.view(shape) * query.view(shape)).sum(-1, keepdim=True) / math.sqrt(self.hidden_size)
-        gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
+        # out= and in-place throughout: a bare sum/sigmoid/sqrt allocates, which the MPS decode
+        # tape cannot replay and which drops the whole model back to the eager loop
+        product = key.view(shape) * query.view(shape)
+        gate = torch.empty(product.shape[:-1] + (1,), dtype=product.dtype, device=product.device)
+        torch.sum(product, -1, keepdim=True, out=gate)
+        gate.div_(math.sqrt(self.hidden_size))
+        sign = torch.empty_like(gate)
+        torch.sign(gate, out=sign)
+        gate.abs_().clamp_min_(1e-6).sqrt_().mul_(sign).sigmoid_()
         gated = (gate * value.unsqueeze(-2)).flatten(-2)
         states = conv_states if conv_states is not None else self._conv_state_slab(R)
         x = self.norm_conv.forward(gated)
@@ -627,7 +674,7 @@ class PLELayer(BaseOP):
             -self.state_len, 0, device=x.device
         )
         window = x[src].transpose(-1, -2).contiguous()
-        states.index_copy_(0, fla.track_dst, window.to(states.dtype))
+        states.index_put_((fla.track_dst,), window.to(states.dtype))
 
     def _conv_state_slab(self, R: torch.Tensor) -> torch.Tensor:
         pool = get_global_ctx().linear_state_pool
@@ -656,16 +703,27 @@ class PLELayer(BaseOP):
     def _decode_conv(
         self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor
     ) -> torch.Tensor:
-        """Batched tap read: taps t-9, t-6, t-3 come off the state slab, tap t from this token."""
+        """Batched tap read: taps t-9, t-6, t-3 come off the state slab, tap t from this token.
+
+        Every launch here has an ``out=`` or in-place form, so the MPS decode tape records it."""
         state = self._read_state(meta, states, x.dtype)
         column = x.unsqueeze(-1)
+        taps = state[..., :: self.dilation]
+        window = torch.empty(taps.shape[:-1] + (taps.shape[-1] + 1,), dtype=x.dtype, device=x.device)
+        torch.cat([taps, column], dim=-1, out=window)
         # fp32 products, like the conv1d the prefill path runs
-        window = torch.cat([state[..., :: self.dilation], column], dim=-1).float()
-        out = (window * self.conv1d.weight.squeeze(1).float()).sum(-1)
-        states.index_copy_(
-            0, meta.state_slots, torch.cat([state[..., 1:], column], dim=-1).to(states.dtype)
-        )
-        return F.silu(out.to(x.dtype))
+        product = window.float() * self.conv1d.weight.squeeze(1).float()
+        out = torch.empty(product.shape[:-1], dtype=product.dtype, device=product.device)
+        torch.sum(product, -1, out=out)
+        rolled = torch.empty_like(state)
+        torch.cat([state[..., 1:], column], dim=-1, out=rolled)
+        states.index_put_((meta.state_slots,), rolled.to(states.dtype))
+        # silu as sigmoid + mul_: F.silu(inplace=True) returns its own input, which the tape
+        # classifies as a view and drops
+        activated = out.to(x.dtype)
+        sigmoid = torch.empty_like(activated)
+        torch.sigmoid(activated, out=sigmoid)
+        return activated.mul_(sigmoid)
 
     def _prefill_conv(
         self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor
@@ -688,8 +746,8 @@ class PLELayer(BaseOP):
             history.unsqueeze(0), self.conv1d.weight, groups=width, dilation=self.dilation
         ).squeeze(0)
         new_state = history.index_select(1, next_state_index).view(width, num_reqs, self.state_len)
-        states.index_copy_(
-            0, meta.state_slots, new_state.permute(1, 0, 2).to(states.dtype).contiguous()
+        states.index_put_(
+            (meta.state_slots,), new_state.permute(1, 0, 2).to(states.dtype).contiguous()
         )
         return F.silu(out.index_select(1, out_index).transpose(0, 1))
 
@@ -711,7 +769,7 @@ class PLELayer(BaseOP):
         )
         if torch.cuda.is_available():
             packed = packed.pin_memory()
-        packed = packed.to(device, non_blocking=True)
+        packed = packed.to(device, non_blocking=device_backend.stage_h2d(packed))
         n_out, n_state = out_index.numel(), len(lens) * state_len
         return packed[:n_out], packed[n_out : n_out + n_state], packed[n_out + n_state :]
 

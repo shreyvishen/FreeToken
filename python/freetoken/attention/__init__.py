@@ -95,9 +95,9 @@ def create_triton_backend(config: ModelConfig):
 @SUPPORTED_ATTENTION_BACKENDS.register(
     "metal",
     BackendInfo(
-        supported_types=frozenset({AttnType.FULL}),
-        # Full causal GQA only: the MPS SDPA call behind it takes no window and
-        # no sinks, so a spec-needing model must be refused at config time.
+        supported_types=frozenset({AttnType.FULL, AttnType.QSA}),
+        # The MPS kernels take no window and no sinks: a spec-needing model is refused at config
+        # time. QSA pins page_size 64 from its required type, so a dense model keeps its own.
         consumes_attn_spec=False,
     ),
 )

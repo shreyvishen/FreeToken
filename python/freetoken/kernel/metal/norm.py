@@ -18,7 +18,7 @@ using namespace metal;
 #define NSG (TG / 32)
 #define HAS_RESIDUAL {has_residual}
 #define HAS_GATE {has_gate}
-#define HAS_BIAS {has_bias}
+#define GATE_SILU {gate_silu}
 #define PLUS_ONE {plus_one}
 #define HAS_WEIGHT {has_weight}
 #define IS_L2 {is_l2}
@@ -81,12 +81,13 @@ kernel void rms_norm(
 #if HAS_WEIGHT
     y *= w;
 #endif
-#if HAS_BIAS
-    y += float(bias[i]);
-#endif
 #if HAS_GATE
     float g = float(gate[base + i]);
+#if GATE_SILU
     y *= g / (1.0f + exp(-g));
+#else
+    y /= (1.0f + exp(-g));
+#endif
 #endif
     out[base + i] = IN_T(y);
   }}
@@ -95,8 +96,8 @@ kernel void rms_norm(
 
 
 @functools.lru_cache(maxsize=None)
-def _library(dtype, tg, *, has_residual, has_gate, has_bias, plus_one,
-             has_weight=True, is_l2=False):
+def _library(dtype, tg, *, has_residual, has_gate, plus_one,
+             has_weight=True, is_l2=False, gate_silu=True):
     decls = ["device IN_T* out", "device const IN_T* inp"]
     if has_weight:
         decls.append("device const IN_T* weight")
@@ -104,8 +105,6 @@ def _library(dtype, tg, *, has_residual, has_gate, has_bias, plus_one,
         decls.insert(1, "device IN_T* resid")
     if has_gate:
         decls.append("device const IN_T* gate")
-    if has_bias:
-        decls.append("device const IN_T* bias")
     decls.append("constant uint& N")
     decls.append("constant float& eps")
     decls.append("constant float& post_scale")
@@ -117,7 +116,7 @@ def _library(dtype, tg, *, has_residual, has_gate, has_bias, plus_one,
             params=params,
             has_residual=int(has_residual),
             has_gate=int(has_gate),
-            has_bias=int(has_bias),
+            gate_silu=int(gate_silu),
             plus_one=int(plus_one),
             has_weight=int(has_weight),
             is_l2=int(is_l2),
@@ -125,7 +124,7 @@ def _library(dtype, tg, *, has_residual, has_gate, has_bias, plus_one,
     )
 
 
-def _tg_for(n: int) -> int:
+def tg_for(n: int) -> int:
     return max(32, min(_MAX_TG, ((n + 31) // 32) * 32))
 
 
@@ -148,8 +147,8 @@ def rmsnorm_metal(x: torch.Tensor, weight: torch.Tensor, eps: float, out=None, p
     m, n = x.shape
     y = torch.empty_like(x) if out is None else out
     if m:
-        tg = _tg_for(n)
-        lib = _library(x.dtype, tg, has_residual=False, has_gate=False, has_bias=False,
+        tg = tg_for(n)
+        lib = _library(x.dtype, tg, has_residual=False, has_gate=False,
                        plus_one=plus_one)
         lib.rms_norm(y, x, weight, n, float(eps), 1.0, threads=(tg, m, 1), group_size=(tg, 1, 1))
     return y
@@ -162,28 +161,27 @@ def fused_add_rmsnorm_metal(
     m, n = x.shape
     if not m:
         return
-    tg = _tg_for(n)
-    lib = _library(x.dtype, tg, has_residual=True, has_gate=False, has_bias=False,
+    tg = tg_for(n)
+    lib = _library(x.dtype, tg, has_residual=True, has_gate=False,
                    plus_one=plus_one)
     lib.rms_norm(x, residual, x, weight, n, float(eps), 1.0,
                  threads=(tg, m, 1), group_size=(tg, 1, 1))
 
 
 def rms_norm_gated_metal(
-    x: torch.Tensor, weight: torch.Tensor, bias, z: torch.Tensor, eps: float, plus_one=False
+    x: torch.Tensor, weight: torch.Tensor, z: torch.Tensor, eps: float, plus_one=False,
+    gate_silu: bool = True,
 ) -> torch.Tensor:
-    """``(rmsnorm(x) + bias) * silu(z)`` in one launch -- the GDN output gate."""
+    """``rmsnorm(x) * act(z)`` in one launch -- the GDN output gate, silu or sigmoid."""
     m, n = x.shape
     y = torch.empty_like(x)
     if not m:
         return y
-    tg = _tg_for(n)
-    lib = _library(x.dtype, tg, has_residual=False, has_gate=True, has_bias=bias is not None,
-                   plus_one=plus_one)
-    args = [y, x, weight, z.contiguous()]
-    if bias is not None:
-        args.append(bias.contiguous())
-    lib.rms_norm(*args, n, float(eps), 1.0, threads=(tg, m, 1), group_size=(tg, 1, 1))
+    tg = tg_for(n)
+    lib = _library(x.dtype, tg, has_residual=False, has_gate=True, plus_one=plus_one,
+                   gate_silu=gate_silu)
+    lib.rms_norm(y, x, weight, z.contiguous(), n, float(eps), 1.0,
+                 threads=(tg, m, 1), group_size=(tg, 1, 1))
     return y
 
 
@@ -193,8 +191,8 @@ def l2norm_metal(x: torch.Tensor, eps: float = 1e-6, post_scale: float = 1.0) ->
     m, n = rows.shape
     y = torch.empty_like(rows)
     if m:
-        tg = _tg_for(n)
-        lib = _library(x.dtype, tg, has_residual=False, has_gate=False, has_bias=False,
+        tg = tg_for(n)
+        lib = _library(x.dtype, tg, has_residual=False, has_gate=False,
                        plus_one=False, has_weight=False, is_l2=True)
         lib.rms_norm(y, rows, n, float(eps), float(post_scale),
                      threads=(tg, m, 1), group_size=(tg, 1, 1))
@@ -203,4 +201,5 @@ def l2norm_metal(x: torch.Tensor, eps: float = 1e-6, post_scale: float = 1.0) ->
 
 __all__ = [
     "fused_add_rmsnorm_metal", "l2norm_metal", "rms_norm_gated_metal", "rmsnorm_metal", "supports",
+    "tg_for",
 ]

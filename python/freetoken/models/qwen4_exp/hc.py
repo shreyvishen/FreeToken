@@ -14,12 +14,6 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 import torch.nn.functional as F
-from freetoken.kernel.triton.hc import (
-    grouped_gemma_rmsnorm,
-    hc_combine,
-    hc_gate_mix,
-    hc_silu,
-)
 from freetoken.layers import BaseOP, LinearReplicated
 
 if TYPE_CHECKING:
@@ -50,9 +44,18 @@ class GroupedPlusOneRMSNorm(BaseOP):
         self.num_groups = num_groups
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # the kernel is 2D-only, higher-rank callers keep the torch chain
+        # both kernels are 2D-only, higher-rank callers keep the torch chain
         if x.is_cuda and x.dim() == 2:
+            from freetoken.kernel.triton.hc import grouped_gemma_rmsnorm
+
             return grouped_gemma_rmsnorm(x, self.weight, self.eps, self.num_groups)
+        if x.device.type == "mps":
+            from freetoken.kernel.metal import hc as metal_hc
+
+            if metal_hc.supports_grouped_norm(x, self.weight, self.num_groups):
+                return metal_hc.grouped_plus_one_rms_norm_metal(
+                    x, self.weight, self.eps, self.num_groups
+                )
         return grouped_plus_one_rms_norm(x, self.weight, self.eps, self.num_groups)
 
 
@@ -120,10 +123,22 @@ class GatedResidual(BaseOP):
         return down[:, : self.lowrank], down[:, self.lowrank : self.lowrank + self.hc_count]
 
     def _mix_kernel(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        from freetoken.kernel.triton.hc import grouped_gemma_rmsnorm, hc_gate_mix, hc_silu
+
         rn = grouped_gemma_rmsnorm(R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count)
         lora, s = self._down(rn)
         gate = self.input_mix_weight_up.forward(hc_silu(lora, self.hc_count))
         return hc_gate_mix(rn, gate, self.hc_count), s
+
+    def _mix_metal(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        from freetoken.kernel.metal import hc as metal_hc
+
+        rn = metal_hc.grouped_plus_one_rms_norm_metal(
+            R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count
+        )
+        lora, s = self._down(rn)
+        gate = self.input_mix_weight_up.forward(metal_hc.hc_silu_metal(lora, self.hc_count))
+        return metal_hc.hc_gate_mix_metal(rn, gate, self.hc_count), s
 
     def _mix_torch(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
         rn = grouped_plus_one_rms_norm(R, self.hc_norm.weight, self.hc_norm.eps, self.hc_count)
@@ -142,12 +157,28 @@ class GatedResidual(BaseOP):
 
     def mix(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
         """Return the block input ``x [T, hidden]`` and the inject logits ``s [T, hc_count]`` (None if no combine)."""
-        return self._mix_kernel(R) if R.is_cuda else self._mix_torch(R)
+        if R.is_cuda:
+            return self._mix_kernel(R)
+        if R.device.type == "mps":
+            from freetoken.kernel.metal import hc as metal_hc
+
+            # the grouped norm's contract covers the whole chain: everything after it is
+            # this module's own output or a dense GEMM result
+            if metal_hc.supports_grouped_norm(R, self.hc_norm.weight, self.hc_count):
+                return self._mix_metal(R)
+        return self._mix_torch(R)
 
     def combine(self, R: torch.Tensor, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         """Inject the block output ``y [T, hidden]`` back into every stream of ``R``."""
         if R.is_cuda:
+            from freetoken.kernel.triton.hc import hc_combine
+
             return hc_combine(R, y, s, self.hc_count)
+        if R.device.type == "mps":
+            from freetoken.kernel.metal import hc as metal_hc
+
+            if metal_hc.supports_combine(R, y, s, self.hc_count):
+                return metal_hc.hc_combine_metal(R, y, s, self.hc_count)
         return self._combine_torch(R, y, s)
 
 

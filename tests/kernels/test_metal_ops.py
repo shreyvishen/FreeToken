@@ -7,8 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from freetoken.kernel.metal import is_available
-from freetoken.kernel.metal import conv, elementwise, norm, ops, rope, sampling
-from freetoken.kernel.metal.fp8 import can_run as fp8_can_run
+from freetoken.kernel.metal import conv, elementwise, hc, norm, ops, rope, sampling
 from freetoken.kernel.metal.fp8 import dequant_fp8, fp8_gemv, fp8_linear
 from freetoken.kernel.metal.mlp import can_run as mlp_can_run
 from freetoken.kernel.metal.mlp import dense_gemv, swiglu_gemv
@@ -23,6 +22,9 @@ ROPE_SHAPES = ((5, 16, 2, 256, 64), (7, 2, 1, 128, 20))
 NORM_SHAPES = ((1, 2048), (7, 300))
 GEMV_SHAPES = ((1, 2048, 512), (3, 126, 200))
 CONV_SHAPES = ((1, 1536, 4), (2, 300, 2))
+# (tokens, hidden, hc_count, lowrank): Flash Next at decode and at the grid tail, a hidden 300
+# that leaves a reduction remainder, and a lowrank narrower than one simdgroup.
+HC_SHAPES = ((1, 2560, 4, 320), (257, 2560, 4, 320), (3, 300, 4, 320), (3, 96, 2, 24))
 
 
 def _cos_sin(max_pos, rotary_dim, base=1e7):
@@ -55,7 +57,7 @@ def test_rope():
             for got, src, heads in ((qm, q, hq), (km, k, hk)):
                 view = got.cpu().view(nnz, heads, head_size)
                 want = _rope_ref(src, nnz, heads, head_size, rot, cos, sin, is_neox)
-                _close(view, want.bfloat16(), 8e-3, 8e-3)
+                _close(view, want.bfloat16(), 8e-3, 8e-3)  # measured bit-exact
                 assert torch.equal(view[:, :, rot:],
                                    src.view(nnz, heads, head_size)[:, :, rot:])
             qc, kc = q.clone(), k.clone()
@@ -74,24 +76,90 @@ def test_norm():
             torch.manual_seed(0)
             x, z = torch.randn(2, m, n, dtype=torch.bfloat16)
             w = torch.randn(n, dtype=torch.bfloat16)
-            b = torch.randn(n, dtype=torch.bfloat16) if plus_one else None
+            # measured max abs 2.2e-02
             _close(norm.rmsnorm_metal(x.to("mps"), w.to("mps"), 1e-6, plus_one=plus_one),
                    _rmsnorm_f32(x, w, 1e-6, plus_one), 1e-3, 4e-3)
             xm, rm = x.to("mps"), z.to("mps").clone()
             norm.fused_add_rmsnorm_metal(xm, rm, w.to("mps"), 1e-6)
             resid = (x.float() + z.float()).bfloat16()
             assert torch.equal(rm.cpu(), resid)
-            _close(xm, _rmsnorm_f32(resid, w, 1e-6), 1e-3, 4e-3)
-            gated = norm.rms_norm_gated_metal(
-                x.to("mps"), w.to("mps"), None if b is None else b.to("mps"), z.to("mps"), 1e-6
-            )
-            want = _rmsnorm_f32(x, w, 1e-6) + (0.0 if b is None else b.float())
+            _close(xm, _rmsnorm_f32(resid, w, 1e-6), 1e-3, 4e-3)  # measured max abs 1.5e-02
+            want = _rmsnorm_f32(x, w, 1e-6)
+            # measured max abs 3.0e-02 (silu gate), 7.8e-03 (sigmoid gate)
+            gated = norm.rms_norm_gated_metal(x.to("mps"), w.to("mps"), z.to("mps"), 1e-6)
             _close(gated, want * F.silu(z.float()), 2e-3, 8e-3)
+            sig = norm.rms_norm_gated_metal(x.to("mps"), w.to("mps"), z.to("mps"), 1e-6,
+                                            gate_silu=False)
+            _close(sig, want * torch.sigmoid(z.float()), 2e-3, 8e-3)
             sq = x.float().pow(2).sum(-1, keepdim=True)
+            # measured max abs 3.1e-05
             _close(norm.l2norm_metal(x.to("mps"), 1e-6, n**-0.5),
                    x.float() * torch.rsqrt(sq + 1e-6) * n**-0.5, 8e-3, 8e-3)
     empty, ones = torch.empty(0, 128, device="mps").bfloat16(), torch.ones(128, device="mps")
     assert norm.rmsnorm_metal(empty, ones.bfloat16(), 1e-6).shape == (0, 128)   # zero-row return
+
+
+def test_gemma_norm_entry_points():
+    """``layers.norm.GemmaPlusOne*`` binds these by name off the device seam; without them a
+    qwen4_exp q/k norm falls through to ``import triton`` and the model never builds."""
+    torch.manual_seed(1)
+    x, z = torch.randn(2, 7, 300, dtype=torch.bfloat16)
+    w = torch.randn(300, dtype=torch.bfloat16)
+    want = _rmsnorm_f32(x, w, 1e-6, plus_one=True)
+    out = torch.empty_like(x, device="mps")
+    assert ops.gemma_rmsnorm(x.to("mps"), w.to("mps"), 1e-6, out=out) is out
+    _close(out, want, 1e-3, 4e-3)  # measured max abs 1.6e-02
+    xm, rm = x.to("mps"), z.to("mps").clone()
+    ops.gemma_fused_add_rmsnorm(xm, rm, w.to("mps"), 1e-6)
+    resid = (x.float() + z.float()).bfloat16()
+    assert torch.equal(rm.cpu(), resid)
+    _close(xm, _rmsnorm_f32(resid, w, 1e-6, plus_one=True), 1e-3, 4e-3)  # measured max abs 1.5e-02
+    # the torch fallback the unsupported-shape branch takes must apply the +1 too
+    x3 = torch.randn(2, 3, 64, dtype=torch.bfloat16, device="mps")
+    w3 = torch.randn(64, dtype=torch.bfloat16, device="mps")
+    # measured max abs 2.9e-02
+    _close(ops.gemma_rmsnorm(x3, w3, 1e-6), _rmsnorm_f32(x3.cpu(), w3.cpu(), 1e-6, True), 1e-3, 4e-3)
+
+
+def test_hc():
+    """The four hyper-connection kernels against the fp32 torch chain they replace, on column
+    slices of one merged GEMM output as ``GatedResidual._down`` hands them over."""
+    for tokens, hidden, count, lowrank in HC_SHAPES:
+        torch.manual_seed(tokens + hidden + lowrank)
+        dim, split = count * hidden, lowrank + count
+        # the merged down GEMM's 16-row alignment, as GatedResidual.__init__ computes it
+        rows = split + (-split) % 16
+        r, gate = torch.randn(2, tokens, dim, dtype=torch.bfloat16)
+        w = torch.randn(dim, dtype=torch.bfloat16) * 0.1
+        y = torch.randn(tokens, hidden, dtype=torch.bfloat16)
+        down = torch.randn(tokens, rows, dtype=torch.bfloat16)
+        rm, gm, ym, dm = (t.to("mps") for t in (r, gate, y, down))
+
+        rf = r.float().unflatten(-1, (count, hidden))
+        rf = rf * torch.rsqrt(rf.pow(2).mean(-1, keepdim=True) + 1e-6)
+        want = rf.flatten(-2) * (1.0 + w.float())
+        rn = hc.grouped_plus_one_rms_norm_metal(rm, w.to("mps"), 1e-6, count)
+        _close(rn, want, 1e-3, 4e-3)  # measured max abs 1.5e-02
+
+        lora = down[:, :lowrank].float()
+        # measured max abs 3.7e-03
+        _close(hc.hc_silu_metal(dm[:, :lowrank], count), F.silu(lora / count), 2e-3, 8e-3)
+
+        mixed = torch.sigmoid(gate.float()) * rn.cpu().float()
+        # measured max abs 3.9e-03
+        _close(hc.hc_gate_mix_metal(rn, gm, count),
+               mixed.unflatten(-1, (count, hidden)).mean(-2), 2e-3, 8e-3)
+
+        inject = 2.0 * torch.sigmoid(down[:, lowrank:split].float() / count)
+        combined = r.float().unflatten(-1, (count, hidden))
+        combined = (combined + y.float().unsqueeze(-2) * inject.unsqueeze(-1)).flatten(-2)
+        # measured max abs 1.6e-02
+        _close(hc.hc_combine_metal(rm, ym, dm[:, lowrank:split], count), combined, 2e-3, 8e-3)
+
+    empty = torch.empty(0, 512, dtype=torch.bfloat16, device="mps")   # zero-row early return
+    assert hc.grouped_plus_one_rms_norm_metal(
+        empty, torch.ones(512, dtype=torch.bfloat16, device="mps"), 1e-6, 4
+    ).shape == (0, 512)
 
 
 def test_elementwise():
@@ -100,12 +168,14 @@ def test_elementwise():
         for broadcast in (False, True):
             x = torch.randn(m, 2 * n, dtype=torch.bfloat16).to("mps")
             gate, up = x.cpu().float().chunk(2, dim=-1)
+            # measured max abs 1.4e-02
             _close(elementwise.silu_and_mul_metal(x), F.silu(gate) * up, 8e-3, 8e-3)
             y, g = x[:, :n].contiguous(), torch.randn(
                 m, 1 if broadcast else n, dtype=torch.bfloat16).to("mps")
             add = torch.randn(m, n, dtype=torch.bfloat16).to("mps") if broadcast else None
             got = elementwise.sigmoid_gate_mul_metal(y, g, add)
             want = y.cpu().float() * torch.sigmoid(g.cpu().float())
+            # measured max abs 7.8e-03
             _close(got, want if add is None else want + add.cpu().float(), 8e-3, 8e-3)
     empty = torch.empty(0, 64, dtype=torch.bfloat16, device="mps")   # zero-row early return
     assert (elementwise.silu_and_mul_metal(empty).shape,
@@ -122,6 +192,7 @@ def test_conv():
         got = conv.causal_conv1d_decode_metal(x.to("mps"), state_m, weight.to("mps"), idx.to("mps"))
         window = torch.cat([state[idx.long()].double(), x.double().unsqueeze(-1)], dim=-1)
         want = F.silu((window * weight.double().unsqueeze(0)).sum(-1))
+        # measured max abs 3.1e-02
         torch.testing.assert_close(got.cpu().double(), want, rtol=8e-3, atol=2e-2)
         assert torch.equal(state_m.cpu()[idx.long()].double(), window[..., 1:])
         idle = [i for i in range(slots) if i not in idx.tolist()]
@@ -138,8 +209,8 @@ def test_conv():
     whole = varlen(x.clone(), w, one, T([0, 9]), has_initial_state=T([False]), **kw)
     a = varlen(x[:, :4].clone(), w, split, T([0, 4]), has_initial_state=T([False]), **kw)
     b = varlen(x[:, 4:].clone(), w, split, T([0, 5]), has_initial_state=T([True]), **kw)
-    torch.testing.assert_close(whole, torch.cat([a, b], dim=-1))
-    torch.testing.assert_close(one, split)   # and the state each carried away
+    torch.testing.assert_close(whole, torch.cat([a, b], dim=-1))  # measured bit-exact
+    torch.testing.assert_close(one, split)   # and the state each carried away; measured bit-exact
 
 
 def test_mlp():
@@ -147,6 +218,7 @@ def test_mlp():
         for dtype in (torch.float32, torch.bfloat16):
             g, tol = torch.Generator().manual_seed(41), 1e-4 if dtype is torch.float32 else 3e-2
             x, w = torch.randn(m, k, generator=g), torch.randn(2 * n, k, generator=g) * 0.05
+            # measured max abs 1.9e-02 (dense_gemv), 5.7e-06 (swiglu_gemv)
             _close(dense_gemv(x.to(dtype).to("mps"), w[:n].to(dtype).to("mps")), F.linear(x, w[:n]),
                    tol, tol)
             _close(swiglu_gemv(x.to("mps"), w.to("mps")),
@@ -160,6 +232,7 @@ def test_mlp():
     norm.fused_add_rmsnorm_metal(x_ref, r_ref, nw, 1e-6)
     got, xn = dense_gemv(x, w, norm=(r, r_out, nw, 1e-6))
     assert torch.equal(r_out.cpu(), r_ref.cpu())
+    # measured max abs 7.2e-07 (normed x), 3.6e-07 (gemv output)
     _close(xn, x_ref, 1e-5, 1e-5)
     _close(got, dense_gemv(x_ref, w), 1e-5, 1e-5)
     # K past the 32 KiB threadgroup tile: the caller falls back to F.linear
@@ -183,7 +256,7 @@ def test_fp8_gemv():
             scale = (torch.rand(n, generator=g) * 0.05 + 0.01).float()
             want = F.linear(x.float(), w8.float() * scale[:, None])
             got = fp8_gemv(x.to(dtype).to("mps"), wu8.to("mps"), scale.to("mps"))
-            _close(got, want, tol * max(1.0, want.abs().max().item()), tol)
+            _close(got, want, tol * max(1.0, want.abs().max().item()), tol)  # measured max abs 4.4e-03
             assert torch.equal(dequant_fp8(wu8.to("mps"), scale.to("mps"), dtype=torch.float32).cpu(),
                                w8.float() * scale[:, None])
     g = torch.Generator().manual_seed(31)   # fp8_linear keeps the leading dims, adds the bias
@@ -191,11 +264,7 @@ def test_fp8_gemv():
     scale, bias = torch.full((32,), 0.037), torch.randn(32, generator=g)
     got = fp8_linear(x.to("mps"), wu8.to("mps"), scale.to("mps"), bias.to("mps"))
     want = F.linear(x.reshape(-1, 64).float(), w8.float() * scale[:, None]).reshape(2, 3, 32) + bias
-    _close(got, want, 1e-4, 1e-4)
-    w, s = torch.zeros(8, 16, dtype=torch.uint8, device="mps"), torch.ones(8, device="mps")
-    assert fp8_can_run(torch.zeros(1, 16, device="mps"), w, s)
-    assert not fp8_can_run(torch.zeros(1, 8, device="mps"), w, s)   # K mismatch
-    assert not fp8_can_run(torch.zeros(1, 16, device="mps"), w.float(), s)   # not packed u8
+    _close(got, want, 1e-4, 1e-4)  # measured max abs 1.2e-07
 
     # the three optional epilogues, each against the unfused launch it folds in
     m, k, n, nc, ck = 2, 256, 96, 40, 4
@@ -223,7 +292,7 @@ def test_fp8_gemv():
     norm.fused_add_rmsnorm_metal(x_ref, r_ref, nw, 1e-6)
     got, want = fp8_gemv(hidden, w, s, norm=(hidden, residual, r_out, nw, 1e-6)), fp8_gemv(x_ref, w, s)
     assert torch.equal(r_out.cpu(), r_ref.cpu())
-    _close(got, want, 1e-2 * want.float().abs().max().item(), 1e-2)
+    _close(got, want, 1e-2 * want.float().abs().max().item(), 1e-2)  # measured bit-exact
 
 
 def _qkv_chain(qkv, num_q, num_kv, d, qw, kw, eps, cs, pos, kc, vc, loc):
@@ -296,6 +365,15 @@ def test_router():
     _, ids = ops.fused_topk_softmax(logits, topk=40, renormalize=True)
     want = torch.topk(torch.softmax(logits.float(), -1), 40, dim=-1).indices
     assert torch.equal(ids.cpu(), want.cpu().to(torch.int32))
+    # A degenerate row (every logit -inf or NaN) must still name a real expert: an id of E
+    # gathers out of bounds, and MPS reports that at the next sync, frames away from here.
+    # 512 is still the simdgroup path (ceil(512/32) == _MAX_V); 544 is the first that is not.
+    assert (_threads(512), _threads(544)) == (32, 256)
+    for experts in (8, 512, 544):
+        for fill in (float("-inf"), float("nan")):
+            dead = torch.full((3, experts), fill, dtype=torch.bfloat16, device="mps")
+            _, ids = fused_topk_softmax_metal(dead, 2, True, None)
+            assert int(ids.min()) >= 0 and int(ids.max()) < experts, (experts, fill)
 
 
 def test_sampling():
@@ -310,9 +388,11 @@ def test_sampling():
     ones = torch.ones(4, dtype=torch.int32, device="mps")   # k=1 draws the argmax every time
     assert torch.equal(sampling.top_k_sampling_from_probs(probs, ones).long(), probs.argmax(-1))
     p4 = torch.tensor([[0.5, 0.3, 0.15, 0.05]], device="mps")   # top_p keeps the token crossing p
+    # measured bit-exact
     _close(sampling.top_p_renorm_probs(p4, torch.tensor([0.7], device="mps")),
            torch.tensor([[0.625, 0.375, 0.0, 0.0]]), 1e-6, 1e-6)
     temps, logits2 = torch.tensor([0.5, 2.0], device="mps"), torch.randn(2, 16, device="mps")
+    # measured max abs 6.0e-08
     _close(sampling.softmax(logits2, temps),
            torch.softmax(logits2.float().cpu() / temps.cpu().reshape(-1, 1), -1), 1e-6, 1e-6)
     # the candidate-selection fast path must draw from the same support as the probs path
@@ -326,6 +406,13 @@ def test_sampling():
             seen[i].add(int(out[i]))
     assert seen[0] == {int(logits.argmax(-1)[0])}
     assert all(seen[i] <= keep[i] for i in range(3))
+    tie = torch.tensor([[0.4, 0.2, 0.2, 0.2]], device="mps")   # boundary ties stay, as upstream keeps them
+    # measured bit-exact (both calls)
+    _close(sampling.top_k_renorm_probs(tie, torch.tensor([2], device="mps")), tie, 1e-6, 1e-6)
+    _close(sampling.top_p_renorm_probs(tie, torch.tensor([0.5], device="mps")), tie, 1e-6, 1e-6)
+    tied = torch.tensor([[2.0, 1.0, 1.0, 1.0] + [-9.0] * 60])   # k_max=2 cuts its window inside the tie
+    drawn = {int(sampling.top_k_top_p_sample_from_logits(tied, None, torch.tensor([2]), 0.5, 2)) for _ in range(300)}
+    assert drawn == {0, 1, 2, 3}
     # engine/sample.py must reach this module without a flashinfer import
     from freetoken.engine.sample import BatchSamplingArgs, Sampler
 

@@ -163,7 +163,8 @@ class Qwen4ExpAttention(BaseOP):
         o = get_global_ctx().attn_backend.qsa_forward(
             q.view(-1, self.num_q, self.head_dim), k, v, index, self.layer_id, batch
         )
-        gated = o.reshape(-1, self.qo_attn_dim) * torch.sigmoid(gate)
+        # gate is a fresh copy (the reshape of a strided slice), so the in-place form is safe and tape-recordable
+        gated = o.reshape(-1, self.qo_attn_dim) * gate.sigmoid_()
         return self.o_proj.forward(gated)
 
 

@@ -29,7 +29,7 @@ from freetoken.models.qwen4_exp.ple import (
     short_conv_reference,
 )
 
-from .common import EOS, VOCAB, hash_constants, requires_cuda, toy_hf_config
+from .common import DEVICE, EOS, VOCAB, hash_constants, requires_cuda, requires_mps, toy_hf_config
 
 _HF_REF_PYTHON = os.environ.get("FREETOKEN_QWEN4_HF_PYTHON", "")
 _HF_REF_SCRIPT = Path(__file__).with_name("ple_hf_ref.py")
@@ -695,3 +695,42 @@ def test_decode_graph_replay_matches_eager():
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(static_out, replayed)
+
+
+@requires_mps
+def test_layer_on_mps_matches_cpu():
+    """The whole PLE block on mps tracks the cpu reference over a prefill and the decode steps after it."""
+    torch.manual_seed(19)
+    config = _config()
+    args = config.qwen4_args
+    rows = _padded_vocab(args)
+    gen = torch.Generator().manual_seed(7)
+    weight = torch.randn(rows, args.ngram_head_dim, generator=gen) * 0.05
+    cpu = _make_layer(config, table=GpuResidentTable(weight, dtype=torch.float32))
+    gpu = _make_layer(config, device=DEVICE, table=GpuResidentTable(weight.to(DEVICE), dtype=torch.float32))
+    mirror = gpu.state_dict()
+    for name, src in cpu.state_dict().items():
+        mirror[name].copy_(src)
+
+    sequences = [[3, 4, EOS, 5, 6, 8], [2, EOS, 11, 12, 13, 14]]
+    contexts = [[EOS, EOS], [21, 22]]
+    total = sum(len(s) for s in sequences)
+    x = torch.randn(total, args.ple_state_width)
+    states = torch.randn(len(sequences), args.ple_state_width, args.ple_conv_state_len) * 0.1
+
+    cpu_states, gpu_states = states.clone(), states.to(DEVICE)
+    got = gpu.forward(x.to(DEVICE), None, _meta(sequences, contexts, device=DEVICE), gpu_states)
+    want = cpu.forward(x, None, _meta(sequences, contexts), cpu_states)
+    assert torch.allclose(got.cpu(), want, rtol=1e-4, atol=1e-5), "prefill"
+    assert torch.allclose(gpu_states.cpu(), cpu_states, rtol=1e-4, atol=1e-5), "prefill conv state"
+
+    # decode steps carrying the conv state forward
+    window = [s[-2:] for s in sequences]
+    for step, token in enumerate((9, 10, EOS)):
+        tokens = [[token]] * len(sequences)
+        step_x = torch.randn(len(sequences), args.ple_state_width)
+        got = gpu.forward(step_x.to(DEVICE), None, _meta(tokens, window, device=DEVICE, decode=True), gpu_states)
+        want = cpu.forward(step_x, None, _meta(tokens, window, decode=True), cpu_states)
+        assert torch.allclose(got.cpu(), want, rtol=1e-4, atol=1e-5), f"decode step {step}"
+        assert torch.allclose(gpu_states.cpu(), cpu_states, rtol=1e-4, atol=1e-5), f"decode state {step}"
+        window = [[w[1], token] for w in window]

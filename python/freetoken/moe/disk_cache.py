@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import ctypes
-import ctypes.util
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -35,8 +33,7 @@ class DiskMoeCache(OffloadMoeCache):
     construct it like the base cache, then call :meth:`set_disk_source`."""
 
     def set_disk_source(
-        self, reader: ExpertReader, hidden_size: int, intermediate_size: int, *,
-        stage_rows: int = DEFAULT_STAGE_ROWS, threads: int = MAX_THREADS,
+        self, reader: ExpertReader, hidden_size: int, intermediate_size: int
     ) -> None:
         if self.quant_format != "nvfp4":
             raise NotImplementedError(
@@ -51,8 +48,7 @@ class DiskMoeCache(OffloadMoeCache):
             "never kept in sync with the numpy LRU"
         )
         self.reader = reader
-        self.threads = min(threads, MAX_THREADS)
-        self._pool = ThreadPoolExecutor(max_workers=self.threads, thread_name_prefix="ft-moe-disk")
+        self._pool = ThreadPoolExecutor(max_workers=MAX_THREADS, thread_name_prefix="ft-moe-disk")
         h, i = hidden_size, intermediate_size
         specs = nvfp4_bank_specs(self.num_experts, h, i)
 
@@ -64,7 +60,7 @@ class DiskMoeCache(OffloadMoeCache):
 
         # One arena of ``stage_rows`` records, each holding the six banks' rows back to back,
         # so a fetched expert crosses in one copy rather than six.
-        self.stage_rows = stage_rows
+        self.stage_rows = DEFAULT_STAGE_ROWS
         self.intermediate_size = i
         self._layout: list[tuple[str, int, int, tuple[int, ...], torch.dtype]] = []
         offset = 0
@@ -75,7 +71,7 @@ class DiskMoeCache(OffloadMoeCache):
             offset += row_bytes
         self.bytes_per_expert = offset
         (self._host_arena, self._dev_arena, self._arena_np, self._row_view, self._glob,
-         self._dests) = self._make_arena(stage_rows)
+         self._dests) = self._make_arena(self.stage_rows)
         # Two prefetch arenas, alternating so neither is rewritten before the routing D2H two
         # layers later drains the copy that read it. Allocated on first use.
         self._pf_banks: list[tuple] = []
@@ -105,7 +101,6 @@ class DiskMoeCache(OffloadMoeCache):
         self._pending: list[tuple[int, int]] = []  # (expert, slot)
         self._pending_layer: int | None = None
         self.n_misses = 0
-        self._reads_per_expert = reader.reads_per_expert
         # The pin set: each layer's top PIN_FRAC of experts by routing count, held against
         # eviction while the LRU fights over the rest.
         self._pinned = np.zeros((self.cache_size,), dtype=bool)
@@ -118,6 +113,9 @@ class DiskMoeCache(OffloadMoeCache):
         """Freeze the pin set from the decode routing counted so far."""
         pinned = self._pinned
         k = min(max(int(PIN_FRAC * self.num_experts), 1), self.num_experts)
+        # Half the cache at most: PIN_FRAC of a 512-expert layer over 48 layers can name more
+        # slots than the tier holds, and an all-pinned cache re-ranks unbiased on every miss.
+        k = min(k, max(1, self.cache_size // (2 * self.num_layers)))
         # argpartition, not argsort: the order inside the head does not matter.
         head = np.argpartition(-self._route_counts, k - 1, axis=1)[:, :k]
         self._pin_expert = np.zeros((self.num_layers, self.num_experts), dtype=bool)
@@ -139,26 +137,9 @@ class DiskMoeCache(OffloadMoeCache):
         per-row views, the globals zone, the nine ``preadv`` destinations."""
         nbytes = rows * self.bytes_per_expert
         if self.device.type == "mps":
-            # ``pin_memory`` on MPS allocates from the shared heap, so data_ptr() is the
-            # id<MTLBuffer> and [contents] its host address: a pread lands where the GPU reads.
+            # pinned-on-the-shared-heap, so a pread lands where the GPU reads it (kernel/backend.py)
             host = None
-            dev = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
-            objc = ctypes.CDLL(ctypes.util.find_library("objc"))
-            objc.objc_msgSend.restype = ctypes.c_void_p
-            objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            objc.sel_registerName.restype = ctypes.c_void_p
-            objc.sel_registerName.argtypes = [ctypes.c_char_p]
-            buf = dev.data_ptr()
-            ptr = objc.objc_msgSend(buf, objc.sel_registerName(b"contents"))
-            length = objc.objc_msgSend(buf, objc.sel_registerName(b"length")) or 0
-            if not ptr or length < nbytes:
-                raise RuntimeError(
-                    f"pinned MPS tensor is not host-addressable (contents {ptr!r}, "
-                    f"length {length})"
-                )
-            arena_np = np.ctypeslib.as_array(
-                ctypes.cast(ptr, ctypes.POINTER(ctypes.c_uint8)), shape=(nbytes,)
-            )
+            dev, arena_np = backend.shared_host_arena(nbytes)
         else:
             host = torch.empty(nbytes, dtype=torch.uint8)
             dev = torch.empty(nbytes, dtype=torch.uint8, device=self.device)
@@ -192,7 +173,7 @@ class DiskMoeCache(OffloadMoeCache):
         return host, dev, arena_np, row_view, glob, dests
 
     def _read_rows(self, layer_id: int, experts: list[int]) -> None:
-        """Fill staging rows ``0..len(experts)`` from disk, ``threads`` reads in flight."""
+        """Fill staging rows ``0..len(experts)`` from disk, ``MAX_THREADS`` reads in flight."""
         jobs = [(e, self._dests[r]) for r, e in enumerate(experts)]
         if len(jobs) == 1:
             self.reader.read_into(layer_id, jobs[0][0], jobs[0][1])
@@ -311,8 +292,6 @@ class DiskMoeCache(OffloadMoeCache):
 
         self._pending = pending
         self._pending_layer = layer_id
-        self._pending_src_layer = layer_id
-        self._pending_whole_layer = False
         # The slot ids in a buffer this object owns and keeps: the copy reads it lazily.
         values = slots[ids]
         buf = self._slot_buf
@@ -324,8 +303,6 @@ class DiskMoeCache(OffloadMoeCache):
 
     def predict_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Take the ids layer L+1 will route to, predicted on layer L's pre-mixer stream."""
-        if self.reader is None:
-            return
         ids = expert_ids.detach().reshape(-1)
         host = self._pred_host
         if host is None or host.numel() != ids.numel() or host.dtype != ids.dtype:
@@ -337,14 +314,11 @@ class DiskMoeCache(OffloadMoeCache):
 
     def issue_prediction(self, layer_id: int) -> None:
         """Issue the reads predicted a layer ago; the previous layer's drain landed the ids."""
-        if self._pred_layer != layer_id or self.reader is None:
+        if self._pred_layer != layer_id:
             return
         self._pred_layer = -1
         self._pred_src = None
-        self._issue_prefetch(layer_id, self._pred_np.astype(np.int64))
-
-    def _issue_prefetch(self, layer_id: int, ids: np.ndarray) -> None:
-        """Submit the reads for the predicted experts the cache does not hold."""
+        ids = self._pred_np.astype(np.int64)
         self._drop_prefetch()
         # Predictor order: topk sorts descending, so position is confidence rank.
         slots = self._slot_of[layer_id]
@@ -427,8 +401,6 @@ class DiskMoeCache(OffloadMoeCache):
         expert order, which is file order in the repack."""
         self._pending = []
         self._pending_layer = layer_id
-        self._pending_src_layer = layer_id
-        self._pending_whole_layer = True
         for start in range(0, self.num_experts, self.stage_rows):
             chunk = list(range(start, min(start + self.stage_rows, self.num_experts)))
             self._read_rows(layer_id, chunk)

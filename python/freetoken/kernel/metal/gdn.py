@@ -383,6 +383,7 @@ using namespace metal;
 #define HK {hk}
 #define HV {hv}
 #define TGY {tgy}
+#define GATE_SILU {gate_silu}
 #define NPT (DK / 32)      // dk elements per lane, one contiguous block
 #define DVPT (DV / TGY)    // dv columns per simdgroup
 #define NREP_K (DK / 32)   // l2norm_metal's simdgroup partials over Dk
@@ -495,7 +496,11 @@ kernel void gdn_decode_fused(
   for (uint i = sg * 32 + lane; i < DV; i += TGY * 32) {{
     float y = co[i] * nscale * float(nw[i]);
     float gz = float(zr[i]);
+#if GATE_SILU
     y *= gz / (1.0f + exp(-gz));
+#else
+    y /= (1.0f + exp(-gz));
+#endif
     o_[i] = IN_T(y);
   }}
 }}
@@ -513,10 +518,13 @@ def _row_stride(x: torch.Tensor) -> int | None:
 
 
 def fused_decode_supports(
-    mixed, z, a, b, A_log, dt_bias, norm_weight, state_source, hk, hv, dk, dv
+    mixed, z, a, b, A_log, dt_bias, norm_weight, state_source, hk, hv, dk, dv,
+    activation: str = "silu",
 ) -> bool:
     """The fused kernel's contract; anything outside it falls back to the chain."""
     if not (is_available() and mixed.device.type == "mps"):
+        return False
+    if activation not in ("silu", "swish", "sigmoid"):
         return False
     if dk % 32 or dk > 256 or dv % 32 or dv > 256 or hv % hk:
         # > 256 would need l2norm_metal's strided accumulation to be replayed too,
@@ -541,7 +549,7 @@ def fused_decode_supports(
         return False
     if norm_weight.dtype != mixed.dtype or norm_weight.numel() != dv:
         return False
-    if A_log.dtype != dt_bias.dtype or A_log.shape != dt_bias.shape != (hv,):
+    if A_log.dtype != dt_bias.dtype or A_log.shape != (hv,) or dt_bias.shape != (hv,):
         return False
     return (
         mixed.dtype in (torch.float32, torch.float16, torch.bfloat16)
@@ -570,6 +578,7 @@ def gdn_decode_fused_metal(
     num_k_heads: int,
     head_k_dim: int,
     l2_eps: float = 1e-6,
+    activation: str = "silu",
 ) -> torch.Tensor:
     """One launch from the conv output to the gated-normed GDN output, ``[B, Hv*Dv]``."""
     hv, dk, dv = state_source.shape[1], head_k_dim, state_source.shape[3]
@@ -584,6 +593,7 @@ def gdn_decode_fused_metal(
         f"#define ST_T {msl_type(state_source.dtype)}\n"
         f"#define P_T {msl_type(A_log.dtype)}\n",
         dk=dk, dv=dv, hk=num_k_heads, hv=hv, tgy=tgy,
+        gate_silu=int(activation in ("silu", "swish")),
     )
     lib.gdn_decode_fused(
         out, state_source, mixed, z, a, b, A_log, dt_bias, norm_weight,

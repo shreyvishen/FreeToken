@@ -12,7 +12,7 @@ import pytest
 import safetensors.torch
 import torch
 
-from freetoken.moe.disk_cache import PIN_RANK_TOKENS, DiskMoeCache
+from freetoken.moe.disk_cache import PIN_FRAC, PIN_RANK_TOKENS, DiskMoeCache
 from freetoken.moe.expert_reader import _F_RDADVISE, PIECE_ORDER, ExpertReader, Nvfp4DiskIndex
 
 GROUP, FP8 = 16, torch.float8_e4m3fn
@@ -30,15 +30,15 @@ def write_tiny_checkpoint(tmp_path, num_experts=NUM_EXPERTS, layers=(LAYER,)):
     g = torch.Generator().manual_seed(0)
     tensors: dict[str, torch.Tensor] = {}
     for layer in layers:
-      for e in range(num_experts):
-        for proj, out_dim, in_dim in ((f"{prefix(e, layer)}.gate_proj", INTER, HIDDEN),
-                                      (f"{prefix(e, layer)}.up_proj", INTER, HIDDEN),
-                                      (f"{prefix(e, layer)}.down_proj", HIDDEN, INTER)):
-            tensors[f"{proj}.weight"] = torch.randint(
-                0, 256, (out_dim, in_dim // 2), dtype=torch.uint8, generator=g)
-            tensors[f"{proj}.weight_scale"] = (
-                torch.rand(out_dim, in_dim // GROUP, generator=g) * 4).to(FP8)
-            tensors[f"{proj}.weight_scale_2"] = (torch.rand(1, generator=g) * 0.1)[0]
+        for e in range(num_experts):
+            for proj, out_dim, in_dim in ((f"{prefix(e, layer)}.gate_proj", INTER, HIDDEN),
+                                          (f"{prefix(e, layer)}.up_proj", INTER, HIDDEN),
+                                          (f"{prefix(e, layer)}.down_proj", HIDDEN, INTER)):
+                tensors[f"{proj}.weight"] = torch.randint(
+                    0, 256, (out_dim, in_dim // 2), dtype=torch.uint8, generator=g)
+                tensors[f"{proj}.weight_scale"] = (
+                    torch.rand(out_dim, in_dim // GROUP, generator=g) * 4).to(FP8)
+                tensors[f"{proj}.weight_scale_2"] = (torch.rand(1, generator=g) * 0.1)[0]
     safetensors.torch.save_file(tensors, str(tmp_path / "model.safetensors"))
     with open(tmp_path / "model.safetensors.index.json", "w") as f:
         json.dump({"metadata": {}, "weight_map": {n: "model.safetensors" for n in tensors}}, f)
@@ -113,7 +113,9 @@ def test_the_readahead_hint_names_the_bytes_the_read_returns(tmp_path, monkeypat
     reader.read_into(LAYER, 1, [memoryview(d) for d in dests])
     assert hinted == [(loc.offset, loc.nbytes) for loc in locs]
     for loc, got in zip(locs, dests):
-        assert bytes(got) == loc.read().tobytes()
+        with open(loc.shard_path, "rb") as f:
+            f.seek(loc.offset)
+            assert bytes(got) == f.read(loc.nbytes)
     reader.close()
 
     # The repack path hints the one record it is about to read.
@@ -146,3 +148,21 @@ def test_the_pin_set_holds_the_routing_head_against_eviction(tmp_path):
             cache.copy_missing()
     assert int(cache._slot_of[0, head]) >= 0 and int(cache._slot_of[1, head]) >= 0
     cache.close()
+
+
+def test_the_pin_set_never_outgrows_the_slot_cache(tmp_path):
+    """PIN_FRAC of a 512-expert layer over 48 layers names more slots than a small tier holds,
+    and an all-pinned tier re-ranks unbiased on every miss. Here 8 layers x PIN_FRAC of 32
+    experts wants 24 of 32 slots; the cap holds it to half, leaving the LRU something to evict."""
+    experts, layers = 32, 8
+    model_path, _ = write_tiny_checkpoint(tmp_path, num_experts=experts,
+                                          layers=tuple(range(layers)))
+    for cache_size in (experts, 2 * experts):
+        cache = DiskMoeCache(num_layers=layers, num_experts=experts, cache_size=cache_size,
+                             device=torch.device("cpu"), quant_format="nvfp4")
+        cache.set_disk_source(ExpertReader(model_path), HIDDEN, INTER)
+        cache._rank_pins()
+        pinned = int(cache._pin_expert.sum())
+        assert pinned == layers * min(int(PIN_FRAC * experts), cache_size // (2 * layers))
+        assert pinned * 2 <= cache_size, cache_size
+        cache.close()

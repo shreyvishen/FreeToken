@@ -11,7 +11,7 @@ from freetoken.kernel.metal.attention import (
     paged_decode_attention_mps,
     prefill_tile,
 )
-from tests.kernels.reference_attention import reference_paged_attention
+from tests.kernels.test_triton_attention import _reference_paged_attention
 
 pytestmark = pytest.mark.skipif(not is_available(), reason="needs a torch build with MPS")
 
@@ -31,8 +31,8 @@ def _oracle_args(indptr, cu_q):
 def _run(kernel, q, k, v, indptr, indices, cu_q, scale=SCALE, **kw):
     got = kernel(*[t.to("mps") for t in (q, k, v, indptr, indices, cu_q)], scale, **kw).cpu()
     q_to_req, q_positions = _oracle_args(indptr, cu_q)
-    want = reference_paged_attention(q.float(), k.float(), v.float(), indptr, indices,
-                                     q_to_req, q_positions, scale, None)
+    want = _reference_paged_attention(q.float(), k.float(), v.float(), indptr, indices,
+                                      q_to_req, q_positions, scale, None)
     return got, want
 
 
@@ -42,23 +42,25 @@ def _cache(slots, ql, hq=Q_HEADS, hk=KV_HEADS, d=HEAD_DIM, dtype=torch.float32, 
 
 
 def test_paged_decode():
-    # kv_len 3 is shorter than the kernel's 8 SIMD-groups, so five of them see no position
-    # at all and must contribute nothing rather than a NaN; 1000 is not a multiple of 8.
-    for kv_lens in ([3, 17], [1000]):
+    # kv_len 3 leaves five of the kernel's 8 SIMD-groups with no position (they must add 0, not
+    # NaN); 1000 is not a multiple of 8; head_dim 96 is not one of 32 lanes, so the tail guard runs.
+    qwen = (Q_HEADS, KV_HEADS, HEAD_DIM)
+    for kv_lens, (hq, hk, d) in (([3, 17], qwen), ([1000], qwen), ([20, 7], (4, 4, 96))):
         for dtype, tol in ((torch.float32, 2e-5), (torch.bfloat16, 8e-3)):
             total, reqs = sum(kv_lens), len(kv_lens)
             slots = total + 5
-            q, k, v = _cache(slots, reqs, dtype=dtype, seed=total)
+            q, k, v = _cache(slots, reqs, hq, hk, d, dtype=dtype, seed=total)
             # scattered slots, so a kernel that ignored the page table would fail
             indices = torch.randperm(slots)[:total].to(torch.int32)
             indptr = torch.tensor([0] + torch.tensor(kv_lens).cumsum(0).tolist(),
                                   dtype=torch.int32)
             cu_q = torch.arange(reqs + 1, dtype=torch.int32)
-            got, want = _run(paged_decode_attention_mps, q, k, v, indptr, indices, cu_q)
+            got, want = _run(paged_decode_attention_mps, q, k, v, indptr, indices, cu_q, d**-0.5)
             assert got.dtype == dtype
+            # measured max abs 7.4e-03
             torch.testing.assert_close(got.float(), want.float(), rtol=tol, atol=tol)
             # paged_attention_mps must route a one-token-per-request batch to this kernel
-            routed, _ = _run(paged_attention_mps, q, k, v, indptr, indices, cu_q)
+            routed, _ = _run(paged_attention_mps, q, k, v, indptr, indices, cu_q, d**-0.5)
             assert torch.equal(routed, got)
 
     # the fused output gate must equal the separate elementwise launch it folds in
@@ -73,23 +75,6 @@ def test_paged_decode():
     plain = paged_attention_mps(q, k, v, *md, d**-0.5)
     want = sigmoid_gate_mul_metal(plain.reshape(bs, hq * d), gate).reshape(bs, hq, d)
     assert torch.equal(paged_attention_mps(q, k, v, *md, d**-0.5, gate=gate).cpu(), want.cpu())
-
-
-def test_prefill():
-    # a whole prompt (causal), then a chunk that must see its already-cached prefix
-    for q_len, kv_len in ((12, 12), (5, 14)):
-        q, k, v = _cache(32, q_len, seed=q_len)
-        indices = torch.arange(kv_len).to(torch.int32)
-        got, want = _run(paged_attention_mps, q, k, v, torch.tensor([0, kv_len]), indices,
-                         torch.tensor([0, q_len]))
-        torch.testing.assert_close(got, want, rtol=2e-5, atol=2e-5)
-
-    # a mixed batch of uneven requests, read in page-table order rather than slot order
-    q, k, v = _cache(64, 9, seed=5)
-    order = torch.cat([torch.arange(20, 26), torch.arange(40, 51)]).to(torch.int32)
-    got, want = _run(paged_attention_mps, q, k, v, torch.tensor([0, 6, 17]), order,
-                     torch.tensor([0, 6, 9]))
-    torch.testing.assert_close(got, want, rtol=2e-5, atol=2e-5)   # page order, not slot order
 
 
 # (q lengths, kv lengths) per request. 37 is not a multiple of any query tile, so its last
@@ -114,6 +99,7 @@ def test_tiled_prefill_matches_the_oracle(dtype, tol):
                                         dtype=torch.int32)
         got, want = _run(paged_attention_mps, q, k, v, cum(kv_lens), indices, cum(q_lens))
         assert got.dtype == dtype
+        # measured max abs 8.2e-03
         torch.testing.assert_close(got.float(), want.float(), rtol=tol, atol=tol)
 
 
@@ -125,7 +111,7 @@ def test_prefill_falls_back_when_the_kernel_has_no_shape_for_it():
     assert prefill_tile(20, 2) is None
     q, k, v = _cache(40, 9, hq=4, hk=2, d=20, seed=2)
     got, want = _run(paged_attention_mps, q, k, v, *md, scale=20**-0.5)
-    torch.testing.assert_close(got, want, rtol=2e-5, atol=2e-5)
+    torch.testing.assert_close(got, want, rtol=2e-5, atol=2e-5)  # measured max abs 3.6e-07
 
     # and a K/V cache sliced out of a wider tensor is not the flat slab the kernel indexes
     q, wide_k, wide_v = _cache(40, 9, hk=2 * KV_HEADS, seed=3)
@@ -134,20 +120,9 @@ def test_prefill_falls_back_when_the_kernel_has_no_shape_for_it():
     assert not k.is_contiguous()
     got = paged_attention_mps(q, k, v, *[t.to("mps") for t in md], SCALE).cpu()
     q_to_req, q_positions = _oracle_args(md[0], md[2])
-    want = reference_paged_attention(q.cpu().float(), k.cpu().float(), v.cpu().float(),
-                                     md[0], md[1], q_to_req, q_positions, SCALE, None)
-    torch.testing.assert_close(got, want, rtol=2e-5, atol=2e-5)
-
-
-def test_gqa_head_geometry():
-    # 16 query heads over 2 K/V heads, then head_dim 96, which is not a multiple of the
-    # 32-lane SIMD width, so the per-lane tail guard runs
-    for q_heads, kv_heads, d in ((Q_HEADS, KV_HEADS, HEAD_DIM), (4, 4, 96)):
-        q, k, v = _cache(64, 2, q_heads, kv_heads, d, seed=q_heads)
-        indices = torch.cat([torch.arange(40, 60), torch.arange(3, 10)]).to(torch.int32)
-        got, want = _run(paged_decode_attention_mps, q, k, v, torch.tensor([0, 20, 27]),
-                         indices, torch.tensor([0, 1, 2]), scale=d**-0.5)
-        torch.testing.assert_close(got, want, rtol=2e-5, atol=2e-5)
+    want = _reference_paged_attention(q.cpu().float(), k.cpu().float(), v.cpu().float(),
+                                      md[0], md[1], q_to_req, q_positions, SCALE, None)
+    torch.testing.assert_close(got, want, rtol=2e-5, atol=2e-5)  # measured max abs 7.7e-07
 
 
 def test_a_growing_decode_does_not_grow_the_mps_allocator():
@@ -168,3 +143,43 @@ def test_a_growing_decode_does_not_grow_the_mps_allocator():
     grew = torch.mps.driver_allocated_memory() - before
     # Measured over these 512 steps: 11592.7 MiB before the scratch pool, 0.4 MiB after.
     assert grew < 64 << 20, f"driver pool grew {grew / (1 << 20):.1f} MiB over 512 decode steps"
+
+
+def test_qsa_index_attention():
+    """The QSA sparse attend against an fp32 gather-and-softmax over the same token lists:
+    ragged widths, a row whose list is entirely padding, and scattered pool slots."""
+    from freetoken.kernel.metal.qsa import qsa_index_attention_mps
+
+    torch.manual_seed(5)
+    kv_lens, width = [70, 9], 24
+    total, slots = sum(kv_lens), sum(kv_lens) + 6
+    token_to_req = torch.tensor([0, 0, 0, 1, 1], dtype=torch.int32)
+    rows = token_to_req.numel()
+    indptr = torch.tensor([0] + torch.tensor(kv_lens).cumsum(0).tolist(), dtype=torch.int32)
+    indices = torch.randperm(slots)[:total].to(torch.int32)
+    q, k, v = _cache(slots, rows, dtype=torch.bfloat16, seed=5)
+
+    sel = torch.full((rows, width), -1, dtype=torch.int32)
+    for row in range(rows):
+        kv_len = kv_lens[int(token_to_req[row])]
+        n = min(row * 6, kv_len, width)  # row 0 selects nothing at all
+        sel[row, :n] = torch.randperm(kv_len)[:n].to(torch.int32)
+
+    out = torch.empty(rows, Q_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="mps")
+    got = qsa_index_attention_mps(
+        *[t.to("mps") for t in (q, k, v, sel, indptr, indices, token_to_req)], SCALE, out
+    ).cpu()
+
+    rep = Q_HEADS // KV_HEADS
+    want = torch.zeros(rows, Q_HEADS, HEAD_DIM)
+    for row in range(rows):
+        tokens = sel[row][sel[row] >= 0].long()
+        if not tokens.numel():
+            continue  # an all-padding row must come back zero, not NaN
+        pool = indices[int(indptr[token_to_req[row]]) + tokens].long()
+        keys = k[pool].float().repeat_interleave(rep, dim=1)
+        values = v[pool].float().repeat_interleave(rep, dim=1)
+        scores = torch.einsum("hd,khd->hk", q[row].float(), keys) * SCALE
+        want[row] = torch.einsum("hk,khd->hd", scores.softmax(-1), values)
+    assert got.dtype == torch.bfloat16
+    torch.testing.assert_close(got.float(), want, rtol=8e-3, atol=8e-3)  # measured max abs 3.9e-03

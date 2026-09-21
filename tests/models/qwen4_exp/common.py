@@ -19,6 +19,9 @@ EOS = 7
 VOCAB = 512
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+requires_gpu = pytest.mark.skipif(DEVICE == "cpu", reason="needs a GPU")
+requires_mps = pytest.mark.skipif(DEVICE != "mps", reason="needs an Apple GPU")
 
 
 def hf_config(
@@ -151,11 +154,10 @@ class Fixture:
         config,
         num_pages: int,
         max_running_req: int = 8,
-        device: str = "cuda",
+        device: str = DEVICE,
         dtype: torch.dtype = torch.bfloat16,
         page_size: int = 64,
     ) -> None:
-        from freetoken.attention.qsa_sparse import QSASparseAttnBackend
         from freetoken.kvcache import create_kvcache_pool
 
         self.config = config
@@ -178,7 +180,7 @@ class Fixture:
         self.ctx = fresh_ctx(
             page_size=page_size, page_table=self.page_table, kv_cache=self.pool
         )
-        self.backend = QSASparseAttnBackend(config)
+        self.backend = qsa_backend(config, self.device)
         self.ctx.attn_backend = self.backend
         self._free = list(range(num_pages))
 
@@ -243,19 +245,29 @@ class Fixture:
         return batch
 
 
-def selection_spy(monkeypatch, backend) -> dict:
-    """Record the expanded token selection of every ``_select`` call."""
+def qsa_backend(config, device: torch.device):
+    """The QSA backend for ``device``: Triton on CUDA, Metal on MPS; both expose ``qsa_forward`` and ``_select``."""
+    if device.type == "mps":
+        from freetoken.attention.metal import MetalAttentionBackend
+
+        return MetalAttentionBackend(config)
     from freetoken.attention.qsa_sparse import QSASparseAttnBackend
 
+    return QSASparseAttnBackend(config)
+
+
+def selection_spy(monkeypatch, backend) -> dict:
+    """Record the expanded token selection of every ``_select`` call."""
     seen: dict[str, torch.Tensor] = {}
-    original = QSASparseAttnBackend._select
+    owner = type(backend)
+    original = owner._select
 
     def spy(self, index, md, slot):
         indices = original(self, index, md, slot)
         seen["indices"] = indices.clone()
         return indices
 
-    monkeypatch.setattr(QSASparseAttnBackend, "_select", spy)
+    monkeypatch.setattr(owner, "_select", spy)
     return seen
 
 

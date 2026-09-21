@@ -29,11 +29,32 @@ from enum import Enum
 
 import torch
 
-from freetoken.utils import init_logger
+from freetoken.utils import init_logger, set_nocache_fd
 
 logger = init_logger(__name__)
 
 _BLK = 4096  # O_DIRECT alignment (page size)
+
+
+def _open_uncached(path: str, *, offset: int = 0, nbytes: int = 0, drop_cache: bool = True) -> int:
+    """Read-only fd that bypasses the page cache. Darwin has neither ``O_DIRECT`` nor
+    ``posix_fadvise``; ``F_NOCACHE`` is its equivalent, and it imposes no block alignment, so
+    the aligned/bounce split below is merely correct there rather than required."""
+    if drop_cache and hasattr(os, "posix_fadvise"):
+        fd0 = os.open(path, os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd0, offset, nbytes, os.POSIX_FADV_DONTNEED)
+        except OSError:
+            pass
+        finally:
+            os.close(fd0)
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECT", 0))
+    try:
+        set_nocache_fd(fd)
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
 
 
 class PinFailed(RuntimeError):
@@ -384,15 +405,8 @@ def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
     """Chunked multi-threaded O_DIRECT read of the whole file ``path`` into ``buf``
     (page-aligned). Returns the file size. The buffer must be >= the rounded-up file size."""
     size = os.path.getsize(path)
-    if drop_cache:
-        try:
-            fd0 = os.open(path, os.O_RDONLY)
-            os.posix_fadvise(fd0, 0, 0, os.POSIX_FADV_DONTNEED)
-            os.close(fd0)
-        except OSError:
-            pass
     mv = buf if isinstance(buf, memoryview) else memoryview(buf)
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    fd = _open_uncached(path, drop_cache=drop_cache)
     offs = list(range(0, size, chunk))
 
     def rd(o):
@@ -435,14 +449,7 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
     if dest_offset + nbytes > len(mv):
         raise ValueError(f"destination holds {len(mv)} bytes, need {dest_offset + nbytes}")
     base = ctypes.addressof(ctypes.c_char.from_buffer(mv))
-    if drop_cache:
-        try:
-            fd0 = os.open(path, os.O_RDONLY)
-            os.posix_fadvise(fd0, file_offset, nbytes, os.POSIX_FADV_DONTNEED)
-            os.close(fd0)
-        except OSError:
-            pass
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    fd = _open_uncached(path, offset=file_offset, nbytes=nbytes, drop_cache=drop_cache)
     scratch = threading.local()
 
     def rd(i: int) -> None:

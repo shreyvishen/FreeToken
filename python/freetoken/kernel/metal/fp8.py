@@ -226,24 +226,6 @@ def _lib(k: int, n: int, nsg: int, nr0: int, vec: int, dtype: torch.dtype,
     return compile(head + src)
 
 
-def can_run(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> bool:
-    """Contiguous 2-D activation of a supported float dtype, a ``uint8`` weight whose
-    inner extent matches it, and a float32 per-row scale, all on MPS."""
-    return (
-        x.device.type == "mps"
-        and x.dtype in (torch.float32, torch.float16, torch.bfloat16)
-        and x.dim() == 2
-        and weight.dim() == 2
-        and weight.dtype == torch.uint8
-        and weight.shape[1] == x.shape[1]
-        and scale.dtype == torch.float32
-        and scale.numel() == weight.shape[0]
-        and x.is_contiguous()
-        and weight.is_contiguous()
-        and scale.is_contiguous()
-    )
-
-
 def fp8_gemv(
     x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor,
     *, extra_weight: torch.Tensor | None = None,
@@ -399,5 +381,5 @@ def quantize_fp8_per_row(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     return q.to(weight.device), scale.to(weight.device)
 
 
-__all__ = ["quantize_fp8_per_row", "can_run", "can_run_conv", "can_run_extra",
+__all__ = ["quantize_fp8_per_row", "can_run_conv", "can_run_extra",
            "can_run_norm", "dequant_fp8", "fp8_gemv", "fp8_linear"]

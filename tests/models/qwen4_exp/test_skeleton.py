@@ -22,7 +22,7 @@ from freetoken.models.qwen4_exp.config import parse_config
 from freetoken.models.qwen4_exp.hc import GatedResidual
 from freetoken.models.qwen4_exp.ple import GpuResidentTable, PLELayer, PLEMetadata
 
-from .common import EOS, hash_constants, requires_cuda, toy_hf_config
+from .common import DEVICE, EOS, hash_constants, requires_cuda, requires_gpu, toy_hf_config
 
 
 def _config(num_layers: int = 4) -> ModelConfig:
@@ -64,13 +64,22 @@ def test_hc_mix_and_combine_match_hf(tokens: int):
     torch.manual_seed(0)
     config = _config()
     args = config.qwen4_args
-    hc = GatedResidual(config)
-    _fill(hc, torch.Generator().manual_seed(1))
+    device = torch.device(DEVICE)
+    with torch.device(device):
+        hc = GatedResidual(config)
+    _fill(hc, torch.Generator(device=device).manual_seed(1))
 
-    R = torch.randn(tokens, args.ple_state_width)
-    y = torch.randn(tokens, args.hidden_size)
+    R = torch.randn(tokens, args.ple_state_width, device=device)
+    y = torch.randn(tokens, args.hidden_size, device=device)
     x, s = hc.mix(R)
     got = hc.combine(R, y, s)
+
+    if DEVICE == "mps":
+        # the torch fallback passes the HF check too, so pin the dispatch, not just the result
+        from freetoken.kernel.metal import hc as metal_hc
+
+        assert metal_hc.supports_grouped_norm(R, hc.hc_norm.weight, args.hc_count)
+        assert metal_hc.supports_combine(R, y, s, args.hc_count)
 
     merged = hc.input_mix_weight_down_block_inject.weight
     ref_x, ref_inject = _hf_gated_residual(
@@ -329,7 +338,7 @@ def _hf_attention(x, attn, config, positions):
     return F.linear(out.reshape(-1, num_q * dim) * torch.sigmoid(gate), attn.o_proj.weight)
 
 
-@requires_cuda
+@requires_gpu
 def test_qsa_layer_matches_hf_dense():
     """The QSA layer under the dense oracle backend equals HF attention, and freezes what the indexer hands the backend."""
     from freetoken.models.qwen4_exp.attention import Qwen4ExpAttention, TorchDenseQSAReference
@@ -337,7 +346,7 @@ def test_qsa_layer_matches_hf_dense():
 
     torch.manual_seed(6)
     config = _config()
-    device, dtype = torch.device("cuda"), torch.bfloat16
+    device, dtype = torch.device(DEVICE), torch.bfloat16
     with torch.device(device), torch_dtype(dtype):
         attn = Qwen4ExpAttention(config, layer_id=3)
     _fill(attn, torch.Generator(device=device).manual_seed(7))
@@ -376,7 +385,7 @@ class _StubLinearMixer(BaseOP):
         return self.out_proj.forward(x)
 
 
-@requires_cuda
+@requires_gpu
 def test_shared_expert_gate_fusion_matches_eager():
     """Qwen4ExpMoE only swaps qwen3_5's gemv+sigmoid+mul+add gate chain for two triton kernels."""
     from freetoken.models.qwen3_5_moe.moe import Qwen3_5MoE
@@ -384,7 +393,7 @@ def test_shared_expert_gate_fusion_matches_eager():
     from freetoken.utils.torch_utils import torch_dtype
 
     config = _config()
-    device, dtype = torch.device("cuda"), torch.bfloat16
+    device, dtype = torch.device(DEVICE), torch.bfloat16
     with torch.device(device), torch_dtype(dtype):
         moe = Qwen4ExpMoE(config, 0)
     _fill(moe, torch.Generator(device=device).manual_seed(21), scale=0.2)
@@ -400,6 +409,8 @@ def test_shared_expert_gate_fusion_matches_eager():
 
     assert fused.shape == x.shape and fused.dtype == dtype
     torch.testing.assert_close(fused, eager, rtol=2e-2, atol=2e-2)
+    # Off CUDA fused and eager are the same call, so only this absolute check has any force.
+    torch.testing.assert_close(fused.float(), ref, rtol=2e-2, atol=2e-2)
     # The fused gate stays in fp32 where the eager chain rounds the scalar to bf16.
     assert (fused.float() - ref).abs().max() <= (eager.float() - ref).abs().max()
 
@@ -427,7 +438,7 @@ def test_shared_gate_kernels_match_torch(num_tokens, hidden, dtype):
     assert (fused.float() - ref).abs().max() <= (eager.float() - ref).abs().max() + 1e-6
 
 
-@requires_cuda
+@requires_gpu
 def test_decoder_stack_prefill_and_decode(monkeypatch):
     """Ragged bs=3 prefill then a bs=3 decode step through the whole model with dummy weights."""
     from freetoken.kvcache.linear_state_pool import LinearStatePool
@@ -439,7 +450,7 @@ def test_decoder_stack_prefill_and_decode(monkeypatch):
     torch.manual_seed(8)
     config = _config()
     args = config.qwen4_args
-    device, dtype = torch.device("cuda"), torch.bfloat16
+    device, dtype = torch.device(DEVICE), torch.bfloat16
     monkeypatch.setattr(model_module, "build_linear_mixer", _StubLinearMixer)
 
     with torch.device(device), torch_dtype(dtype):

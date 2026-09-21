@@ -3,7 +3,6 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
-from freetoken.kernel.backend import is_mps
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
 from freetoken.layers import BaseOP, GatedRMSNorm, LinearColParallelMerged, LinearReplicated
 from freetoken.layers.quantization import QuantConfig
@@ -38,7 +37,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
         # [V, K] while the LinearStatePool declares it [K, V]; these coincide (and the
         # hybrid-radix snapshot scatter h[h_row]->slot is a plain copy) only when the two head
-        # dims are equal. Qwen3.5/3.6 satisfy this (128/128); guard any future config.
+        # dims are equal. Qwen3.5/3.6/3.8 satisfy this (128/128); guard any future config.
         assert head_k_dim == head_v_dim, (
             f"GatedDeltaNet requires head_k_dim == head_v_dim, got {head_k_dim} != {head_v_dim}"
         )
@@ -200,14 +199,14 @@ class Qwen3_5GatedDeltaNet(BaseOP):
 
         if batch.is_decode:
             mixed = (conv_in if conv_done else self._conv_decode(conv_in, fla.cache_indices, pool))
-            # Fused fla decode: l2 norms, gating, recurrence and gated output norm in one
+            # Metal fused decode: l2 norms, gating, recurrence and gated output norm in one
             # launch (kernel/metal/gdn.py). Bit-identical to the chain fallback below.
             fused = gdn_decode_fused(
                 mixed, z, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
                 norm_weight=self.norm.weight, norm_eps=self.norm.eps,
                 state_source=pool.recurrent_states[li], indices=fla.cache_indices,
                 scale=self.head_k_dim ** -0.5, num_k_heads=self.num_k_heads,
-                head_k_dim=self.head_k_dim,
+                head_k_dim=self.head_k_dim, activation=self.norm.activation,
             )
             if fused is not None:
                 return self.out_proj.forward(fused)

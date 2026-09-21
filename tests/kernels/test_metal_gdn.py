@@ -74,6 +74,7 @@ def test_gate_params():
             A_log, dt_bias = torch.randn(heads), torch.randn(heads)
             g, beta = gate_params_metal(*[t.to("mps") for t in (a, b, A_log, dt_bias)])
             want = -A_log.double().exp() * sp(a.double() + dt_bias.double())
+            # measured max abs 1.0e-06 (g), 7.2e-08 (beta)
             torch.testing.assert_close(g.cpu().double(), want, rtol=1e-5, atol=1e-5)
             torch.testing.assert_close(beta.cpu().double(), b.double().sigmoid(), atol=1e-6,
                                        rtol=1e-6)
@@ -81,6 +82,7 @@ def test_gate_params():
     a = torch.tensor([[30.0, -30.0, 0.0, -25.0, 21.0]])
     z = torch.zeros(a.shape[1])
     g, _ = gate_params_metal(a.to("mps"), torch.zeros_like(a).to("mps"), z.to("mps"), z.to("mps"))
+    # measured max abs 8.7e-19
     torch.testing.assert_close(g.cpu(), -z.exp() * sp(a), rtol=1e-6, atol=1e-15)
 
 
@@ -101,24 +103,30 @@ def test_fused_decode():
     # Qwen3.6-35B's GDN shape, then Dv=96 (three simdgroup sweeps) with deep GQA sharing
     for b, hk, hv, dk, dv in ((1, 16, 32, 128, 128), (3, 2, 6, 64, 96)):
         for dtype in (torch.bfloat16, torch.float32):
-            c = _fused_case(b, hk, hv, dk, dv, dtype, seed=b * 31 + dk)
-            args = (c["A_log"], c["dt_bias"], c["norm_weight"], c["state"])
-            assert fused_decode_supports(c["mixed"], c["z"], c["a"], c["b"], *args, hk, hv, dk, dv)
-            chain_state, fused_state = c["state"].clone(), c["state"].clone()
-            qf, kf, vf = torch.split(c["mixed"], [hk * dk, hk * dk, hv * dv], dim=-1)
-            core = gdn_decode_metal(
-                qf.reshape(1, b, hk, dk), kf.reshape(1, b, hk, dk), vf.reshape(1, b, hv, dv),
-                c["a"], c["b"], A_log=c["A_log"], dt_bias=c["dt_bias"],
-                state_source=chain_state, indices=c["slots"], scale=dk**-0.5)
-            want = rms_norm_gated(x=core.reshape(-1, dv), weight=c["norm_weight"], bias=None,
-                                  z=c["z"].reshape(-1, dv), eps=1e-6).reshape(b, -1)
-            got = gdn_decode_fused_metal(
-                c["mixed"], c["z"], c["a"], c["b"], A_log=c["A_log"], dt_bias=c["dt_bias"],
-                norm_weight=c["norm_weight"], norm_eps=1e-6, state_source=fused_state,
-                indices=c["slots"], scale=dk**-0.5, num_k_heads=hk, head_k_dim=dk)
-            torch.mps.synchronize()
-            assert torch.equal(got, want), (got.float() - want.float()).abs().max().item()
-            assert torch.equal(fused_state, chain_state)
+            # sigmoid is Qwen3.8-Flash-Next's output gate; both variants must reproduce the
+            # unfused chain bit for bit, not just to the end-to-end tolerance
+            for act in ("silu", "sigmoid"):
+                c = _fused_case(b, hk, hv, dk, dv, dtype, seed=b * 31 + dk)
+                args = (c["A_log"], c["dt_bias"], c["norm_weight"], c["state"])
+                assert fused_decode_supports(
+                    c["mixed"], c["z"], c["a"], c["b"], *args, hk, hv, dk, dv, act)
+                chain_state, fused_state = c["state"].clone(), c["state"].clone()
+                qf, kf, vf = torch.split(c["mixed"], [hk * dk, hk * dk, hv * dv], dim=-1)
+                core = gdn_decode_metal(
+                    qf.reshape(1, b, hk, dk), kf.reshape(1, b, hk, dk), vf.reshape(1, b, hv, dv),
+                    c["a"], c["b"], A_log=c["A_log"], dt_bias=c["dt_bias"],
+                    state_source=chain_state, indices=c["slots"], scale=dk**-0.5)
+                want = rms_norm_gated(
+                    x=core.reshape(-1, dv), weight=c["norm_weight"], bias=None,
+                    z=c["z"].reshape(-1, dv), eps=1e-6, activation=act).reshape(b, -1)
+                got = gdn_decode_fused_metal(
+                    c["mixed"], c["z"], c["a"], c["b"], A_log=c["A_log"], dt_bias=c["dt_bias"],
+                    norm_weight=c["norm_weight"], norm_eps=1e-6, state_source=fused_state,
+                    indices=c["slots"], scale=dk**-0.5, num_k_heads=hk, head_k_dim=dk,
+                    activation=act)
+                torch.mps.synchronize()
+                assert torch.equal(got, want), (got.float() - want.float()).abs().max().item()
+                assert torch.equal(fused_state, chain_state)
 
     # outside its contract the fused path must decline rather than compute something else
     c = _fused_case(2, 4, 8, 128, 128, torch.bfloat16, seed=11)

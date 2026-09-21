@@ -13,13 +13,27 @@ if TYPE_CHECKING:
 
 @dataclass
 class FLAMetadata:
-    """Per-forward GatedDeltaNet metadata, built once per forward and shared by every
-    GDN layer, replacing the per-layer synchronous H2D rebuilds the op used to do."""
+    """Per-forward GatedDeltaNet (flash-linear-attention) metadata, built once per
+    forward and shared by every GDN layer -- mirrors ``BaseAttnMetadata``. Replaces the
+    per-layer rebuilds the GDN op used to do (``cu_seqlens`` arange, per-request
+    ``cache_indices``/``has_initial_state``), which were pageable, synchronous H2D copies
+    issued in each of the 30 GDN layers.
 
-    cu_seqlens: torch.Tensor          # query indptr, int32 on device
-    cache_indices: torch.Tensor       # per-request recurrent/conv state slot, int32
-    has_initial_state: torch.Tensor | None = None  # prefill only: continues a cached prefix
-    fresh_state_indices: torch.Tensor | None = None  # prefill only: slots to zero first
+    Fields:
+      cu_seqlens          query indptr; decode = arange(bs+1) (1 token/req), prefill =
+                          cumsum of extend_len. int32 on device.
+      cache_indices       per-request recurrent/conv state slot (= Req.table_idx). int32.
+      has_initial_state   prefill only: whether each request continues a cached prefix
+                          (cached_len > 0). None for decode (state always present).
+      fresh_state_indices prefill only: the state-pool slots whose sequence is fresh
+                          (cached_len == 0) and must be zeroed before the chunk kernel
+                          reads them in place. None if there are none / for decode.
+    """
+
+    cu_seqlens: torch.Tensor
+    cache_indices: torch.Tensor
+    has_initial_state: torch.Tensor | None = None
+    fresh_state_indices: torch.Tensor | None = None
 
     # Host copies (prefill only): the Metal conv/GDN kernels iterate requests on the CPU.
     cu_seqlens_host: list[int] | None = None

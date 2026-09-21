@@ -101,6 +101,35 @@ class _MpsEvent(torch.mps.Event):
 PIN_MEMORY = not is_mps()
 NON_BLOCKING = not is_mps()
 
+
+def shared_host_arena(nbytes: int):
+    """An MPS-visible byte buffer and the numpy alias to fill it through, as ``(tensor, array)``.
+
+    ``pin_memory`` on MPS allocates from the shared heap, so ``data_ptr()`` is the id<MTLBuffer>
+    and ``[contents]`` its host address: a ``pread`` into the array lands where a device copy off
+    the tensor picks it up. Callers still own the copy; this only hands out the two aliases."""
+    import ctypes
+    import ctypes.util
+
+    import numpy as np
+
+    # off Metal data_ptr() is a plain host pointer and objc_msgSend on it segfaults
+    assert is_mps(), "shared_host_arena is Metal-only; elsewhere use a host tensor plus an H2D copy"
+
+    buf = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+    objc = ctypes.CDLL(ctypes.util.find_library("objc"))
+    objc.objc_msgSend.restype = ctypes.c_void_p
+    objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    objc.sel_registerName.restype = ctypes.c_void_p
+    objc.sel_registerName.argtypes = [ctypes.c_char_p]
+    ptr = objc.objc_msgSend(buf.data_ptr(), objc.sel_registerName(b"contents"))
+    length = objc.objc_msgSend(buf.data_ptr(), objc.sel_registerName(b"length")) or 0
+    if not ptr or length < nbytes:
+        raise RuntimeError(f"pinned MPS tensor is not host-addressable (contents {ptr!r}, length {length})")
+    array = np.ctypeslib.as_array(ctypes.cast(ptr, ctypes.POINTER(ctypes.c_uint8)), shape=(nbytes,))
+    return buf, array
+
+
 # Queued-but-unproven H2D sources, in per-iteration generations, with a backstop cap.
 _h2d_open: list[torch.Tensor] = []
 _h2d_closed: list[list[torch.Tensor]] = []

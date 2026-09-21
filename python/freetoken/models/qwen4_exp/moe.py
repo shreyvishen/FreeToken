@@ -1,13 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
-from freetoken.kernel.triton.moe_shared_gate import shared_gate_mul_add, shared_gate_sigmoid
 from freetoken.models.qwen3_5_moe.moe import Qwen3_5MoE
-
-if TYPE_CHECKING:
-    from freetoken.models.config import ModelConfig
 
 
 class Qwen4ExpMoE(Qwen3_5MoE):
@@ -16,7 +10,15 @@ class Qwen4ExpMoE(Qwen3_5MoE):
     Same weights, same state dict. The gate reduction stays ahead of the routed experts, which may write into ``hidden_states`` in place.
     """
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, *, norm=None) -> torch.Tensor:
+        if not hidden_states.is_cuda:
+            return super().forward(hidden_states, norm=norm)
+        assert norm is None, "the triton shared-gate path cannot fuse the input norm"
+        from freetoken.kernel.triton.moe_shared_gate import (
+            shared_gate_mul_add,
+            shared_gate_sigmoid,
+        )
+
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate.forward(hidden_states)

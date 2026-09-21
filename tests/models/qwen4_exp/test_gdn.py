@@ -17,9 +17,11 @@ from freetoken.models.qwen4_exp.gdn import Qwen4ExpGatedDeltaNet
 from freetoken.models.qwen4_exp.gdn_reference import Qwen4ExpGatedDeltaNetReference
 from freetoken.utils import torch_dtype
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+from .common import DEVICE, requires_gpu
 
-DEV = torch.device("cuda")
+pytestmark = requires_gpu
+
+DEV = torch.device(DEVICE)
 HIDDEN, HEAD_DIM, CONV_K, EPS = 256, 128, 4, 1e-6
 RTOL = ATOL = 2e-2
 # (num_k_heads, num_v_heads) per value:key head ratio; 3:1 is the Qwen3.8-Flash-Next shape.
