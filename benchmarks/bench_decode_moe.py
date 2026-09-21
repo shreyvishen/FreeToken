@@ -17,14 +17,9 @@ TTFT is the measured run's warm first-token latency (template rendering + prefil
 included). Engine-internal diagnostics (expert-cache miss rate, hybrid fetch split) are
 not exposed over the API and are not reported; VRAM is the server's live /v1/stats figure.
 
-Prefill: ``--prefill`` adds a prefill tok/s row, measured after decode on the same running
-server (no second server spawn). Method mirrors llama-bench's ``pN`` row, which also times
-prompt processing alone:
-
-    prefill_tok_s = (prompt_tokens(N) - prompt_tokens(base)) / (median t(N) - median t(base))
-
-every request ``max_tokens=1``/``temperature=0``, 3 reps/length by default with the median
-taken, and a fresh salt per repetition so a prefix cache can't shortcut the second rep.
+Prefill: ``--prefill`` adds llama-bench's ``pN`` row on the same server after decode,
+``(prompt_tokens(N) - prompt_tokens(base)) / (median t(N) - median t(base))``, every request
+``max_tokens=1``/``temperature=0`` with a fresh salt per repetition so no prefix cache helps.
 
 Prompt: an AIME-25 problem sent as a chat message with thinking enabled -- a real
 reasoning workload, so expert routing is representative. The server renders the chat
@@ -82,8 +77,8 @@ BOXED_INSTRUCTION = (
     "Please reason step by step, and put your final answer within \\boxed{}."
 )
 
-# Filler words for synthetic prefill prompts. One word ~= one token for this tokenizer
-# family is close enough; the real count always comes back from usage.prompt_tokens.
+# Filler words for synthetic prefill prompts, about 1.4 tokens each on the Qwen tokenizer
+# (2,922 words are 4,092 tokens); the row reports the server's own usage.prompt_tokens.
 PREFILL_WORDS = "alpha bravo charlie delta echo foxtrot golf hotel india juliet".split()
 
 
@@ -105,6 +100,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--problem", type=int, default=0, help="0-based AIME problem index")
     p.add_argument("--decode", type=int, default=256, help="decode tokens to measure (D)")
+    p.add_argument(
+        "--decode-reps",
+        type=int,
+        default=1,
+        help="measured decode generations per server; the row reports the median tok/s",
+    )
     p.add_argument(
         "--cache",
         type=int,
@@ -136,8 +137,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--json", dest="json_out", default=None, help="append the result rows here")
     p.add_argument(
         "--prefill",
-        default="512,2048,8192",
-        help="comma list of prompt lengths (tokens) for the prefill tok/s row; empty = skip it",
+        default="",
+        help="comma list of prompt lengths in filler words for the prefill tok/s row; empty = skip it",
     )
     p.add_argument(
         "--prefill-reps",
@@ -206,19 +207,15 @@ def free_port() -> int:
 def serve_cmd(args: argparse.Namespace, backend: str, port: int) -> list[str]:
     if sys.platform == "darwin" and args.gpu:
         sys.exit("[bench] --gpu is refused on Darwin: MPS runs the one integrated GPU, there is nothing to select")
-    moe_backend = backend
-    if backend == "metal":
-        moe_backend = "fused"
     cmd = [
         sys.executable, "-m", "freetoken.cli", "serve",
         "--model", args.model,
         "--host", "127.0.0.1", "--port", str(port),
-        "--moe-backend", moe_backend,
+        "--moe-backend", "fused" if backend == "metal" else backend,
         "--max-running-requests", "1",
         "--max-seq-len-override", str(8192 + args.decode),
         "--memory-ratio", str(args.mem_ratio),
-        # No CUDA graphs on MPS: --no-graph is implied on Darwin regardless of the flag.
-        "--cuda-graph-max-bs", "0" if (args.no_graph or sys.platform == "darwin") else "1",
+        "--cuda-graph-max-bs", "0" if args.no_graph else "1",
         "--moe-hybrid-max-fetch", str(args.hybrid_fetch),
     ]
     if args.gpu:
@@ -337,11 +334,6 @@ def stream_generate(origin: str, model_id: str, problem: str, sampling: dict,
     return {"t0": t0, "stamps": stamps, "text": "".join(pieces), "usage": usage}
 
 
-def parse_prefill_lengths(spec: str) -> list[int]:
-    """Comma list of token counts; blank/whitespace-only entries drop out, "" means skip."""
-    return [int(x) for x in spec.split(",") if x.strip()]
-
-
 def prefill_prompt(n_tokens: int, salt: str) -> str:
     return f"{salt} " + " ".join(PREFILL_WORDS[i % len(PREFILL_WORDS)] for i in range(n_tokens))
 
@@ -404,10 +396,13 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
 
             # Warm the expert cache to a steady-state decode working set.
             stream_generate(origin, model_id, problem, sampling, args)
-            r = stream_generate(origin, model_id, problem, sampling, args)
+            # --decode-reps repeats the measured generation in this same session, so extra
+            # reps don't pay for another checkpoint load (unlike a fresh --decode-reps=1 run).
+            reps = [stream_generate(origin, model_id, problem, sampling, args)
+                    for _ in range(args.decode_reps)]
             stats = get_json(f"{origin}/v1/stats")
 
-            prefill_lengths = parse_prefill_lengths(args.prefill)
+            prefill_lengths = [int(x) for x in args.prefill.split(",") if x.strip()]
             prefill_rows: list[dict] = []
             prefill_base_pt = prefill_base_t = base_runs = None
             prefill_stats = None
@@ -423,7 +418,6 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
                         "prompt_tokens": pt,
                         "median_s": t,
                         "prefill_tok_s": dn / dt if dt > 0 else 0.0,
-                        "ttft_ms": t * 1e3,
                         "runs": runs,
                     })
                 # Live VRAM after the longest length, so a memory regression at long prompts
@@ -433,28 +427,46 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
             stop_server(proc)
             pump.join(timeout=10)
 
-    stamps, usage = r["stamps"], r["usage"]
-    if len(stamps) < 2:
-        sys.exit(f"[bench] need >=2 token events to measure decode, got {len(stamps)}")
-    completion = usage["completion_tokens"]
-    if completion != args.decode:
-        print(f"[bench] WARNING: completion_tokens={completion} != --decode {args.decode}", flush=True)
-    steps = completion - 1
-    decode_time = stamps[-1] - stamps[0]
-    gaps = sorted((b - a) * 1e3 for a, b in zip(stamps, stamps[1:]))
+    decode_runs = []
+    for rep in reps:
+        stamps, usage = rep["stamps"], rep["usage"]
+        if len(stamps) < 2:
+            sys.exit(f"[bench] need >=2 token events to measure decode, got {len(stamps)}")
+        completion = usage["completion_tokens"]
+        if completion != args.decode:
+            print(f"[bench] WARNING: completion_tokens={completion} != --decode {args.decode}", flush=True)
+        steps = completion - 1
+        decode_time = stamps[-1] - stamps[0]
+        gaps = sorted((b - a) * 1e3 for a, b in zip(stamps, stamps[1:]))
+        decode_runs.append({
+            "decode_steps": steps,
+            "decode_tok_s": steps / decode_time if decode_time > 0 else 0.0,
+            "ms_per_token": decode_time / steps * 1e3 if steps > 0 else 0.0,
+            "event_ms_p50": gaps[len(gaps) // 2],
+            "event_ms_p99": gaps[min(len(gaps) - 1, int(len(gaps) * 0.99))],
+            "ttft_ms": (stamps[0] - rep["t0"]) * 1e3,
+            "events": len(stamps),
+            "completion_tokens": completion,
+        })
+    r = reps[-1]
+    last = decode_runs[-1]
+    tok_s_sorted = sorted(d["decode_tok_s"] for d in decode_runs)
     row = {
         "model": args.model,
         "backend": backend,
         "problem": args.problem,
-        "prompt_tokens": usage["prompt_tokens"],
-        "decode_steps": steps,
-        "decode_tok_s": steps / decode_time if decode_time > 0 else 0.0,
-        "ms_per_token": decode_time / steps * 1e3 if steps > 0 else 0.0,
-        "event_ms_p50": gaps[len(gaps) // 2],
-        "event_ms_p99": gaps[min(len(gaps) - 1, int(len(gaps) * 0.99))],
-        "ttft_ms": (stamps[0] - r["t0"]) * 1e3,
-        "events": len(stamps),
-        "completion_tokens": completion,
+        "prompt_tokens": r["usage"]["prompt_tokens"],
+        "decode_steps": last["decode_steps"],
+        "decode_tok_s": statistics.median(tok_s_sorted),
+        "decode_tok_s_min": tok_s_sorted[0],
+        "decode_tok_s_max": tok_s_sorted[-1],
+        "decode_runs": decode_runs,
+        "ms_per_token": statistics.median([d["ms_per_token"] for d in decode_runs]),
+        "event_ms_p50": last["event_ms_p50"],
+        "event_ms_p99": last["event_ms_p99"],
+        "ttft_ms": statistics.median([d["ttft_ms"] for d in decode_runs]),
+        "events": last["events"],
+        "completion_tokens": last["completion_tokens"],
         "vram_gib": stats.get("vram_bytes", 0) / 2**30,
         "sampling": sampling,
         "output_sha1": hashlib.sha1(r["text"].encode()).hexdigest()[:12],
@@ -467,11 +479,13 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
     }
 
     print(f"\n==== decode bs=1 [{backend}] via /v1/chat/completions ====", flush=True)
-    print(f"  decode throughput : {row['decode_tok_s']:8.2f} tok/s  ({row['ms_per_token']:.3f} ms/token)")
+    print(f"  decode throughput : {row['decode_tok_s']:8.2f} tok/s  "
+          f"(min {row['decode_tok_s_min']:.2f} / max {row['decode_tok_s_max']:.2f}, "
+          f"{len(decode_runs)} reps)")
     print(f"  TTFT (warm)       : {row['ttft_ms']:8.1f} ms  (prompt {row['prompt_tokens']} tok)")
-    print(f"  decode measured   : {steps} steps in {decode_time:.3f} s  "
+    print(f"  decode measured   : {last['decode_steps']} steps last rep  "
           f"(event p50 {row['event_ms_p50']:.3f} / p99 {row['event_ms_p99']:.3f} ms, "
-          f"{len(stamps)} events)")
+          f"{last['events']} events)")
     print(f"  vram (server)     : {row['vram_gib']:8.2f} GiB")
     sha_note = "greedy" if args.greedy else "sampled, per-server deterministic"
     print(f"  output sha1       : {row['output_sha1']}  ({sha_note}; compare across backends)")
@@ -480,10 +494,10 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
         print(f"\n==== prefill [{backend}] via /v1/completions ====", flush=True)
         print(f"  base              : prompt_tokens={row['prefill_base_tokens']} "
               f"median={row['prefill_base_median_s']:.4f}s")
-        print(f"  {'tokens':>8} {'median_s':>10} {'prefill_tok_s':>14} {'ttft_ms':>9}  runs")
+        print(f"  {'tokens':>8} {'median_s':>10} {'prefill_tok_s':>14}  runs")
         for pr in row["prefill"]:
-            print(f"  {pr['prompt_tokens']:>8} {pr['median_s']:>10.4f} {pr['prefill_tok_s']:>14.1f} "
-                  f"{pr['ttft_ms']:>9.1f}  {pr['runs']}")
+            print(f"  {pr['prompt_tokens']:>8} {pr['median_s']:>10.4f} {pr['prefill_tok_s']:>14.1f}"
+                  f"  {pr['runs']}")
         print(f"  vram (after longest prefill): {row['prefill_vram_gib']:8.2f} GiB")
     return row
 

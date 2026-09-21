@@ -17,6 +17,57 @@ before each expert read. The hint fills the unified buffer cache whatever `F_NOC
 the 35B row's expert set (15 GiB) ends up served from memory on this 36 GiB box; the 122B's
 (61 GiB) does not fit and gains only the read/compute overlap.
 
+## Same model, three engines -- M4 Max, Qwen3.6-35B-A3B (21 Sep 2026)
+
+One base model in each engine's own 4-bit format, resident on the GPU, same machine, AC power, one
+engine at a time with the GPU to itself. Five repetitions per row: the figure is the median, the
+range is min-max. `pp` is prompt processing alone and `tg` is generation, both in tokens per
+second, with the names and lengths `llama-bench` uses.
+
+| Test | FreeToken, NVFP4 | llama.cpp, UD-Q4_K_M | mlx_lm, 4-bit |
+|---|---|---|---|
+| pp512 | 940.9 (903.8-942.8) | 1238.6 (1232.6-1250.0) | **1248.1** (1229.5-1260.9) |
+| pp2048 | 882.8 (863.1-906.9) | 1218.1 (1137.9-1222.0) | **1481.7** (1475.2-1487.6) |
+| pp4096 | 916.5 (908.1-923.0) | 1185.6 (1163.2-1187.6) | **1461.9** (1455.6-1469.9) |
+| pp8192 | 878.5 (873.9-887.9) | 1068.5 (1060.0-1076.4) | **1397.9** (1338.8-1402.5) |
+| tg128 | 108.3 (107.5-108.9) | 67.5 (67.0-68.2) | **113.7** (113.1-113.9) |
+| tg512 | 106.9 (103.8-107.3) | 66.6 (66.4-66.8) | **112.5** (112.2-112.7) |
+| peak memory | 25.5 GiB (server) | 20.7 GiB (RSS) | 20.5 GiB (MLX peak, 21.99 GB) |
+
+MLX leads every row, though at pp512 it and llama.cpp are within 1 %. Over FreeToken it leads
+prefill by 1.33x to 1.68x and decode by 1.05x. llama.cpp leads FreeToken at prefill by 1.22x to
+1.38x, and FreeToken leads llama.cpp at decode by 1.6x. This replaces the earlier comparison
+against a dense 9B, which was the only GGUF on disk at the time and flattered our prefill.
+
+Checkpoints: `nvidia/Qwen3.6-35B-A3B-NVFP4`; `unsloth/Qwen3.6-35B-A3B-GGUF` `UD-Q4_K_M` (an
+Unsloth Dynamic quant, so precision varies by layer); `mlx-community/Qwen3.6-35B-A3B-4bit`.
+llama.cpp build 89fe242, Metal + BLAS, all layers on the GPU, flash attention `auto`, f16 KV.
+mlx_lm 0.31.1. The three peak-memory figures are three different counters; compare them loosely.
+
+All three columns come from one 66-minute window with nothing else on the GPU. An earlier pass
+of the FreeToken and llama.cpp columns, taken while other processes held memory, read within 1.5 %
+of these on every row but two: FreeToken pp8192 read 797.5 (739.9-881.3) and llama.cpp pp4096
+read 1129.9 (1106.6-1182.9). Two rows here spread more than 5 % of their median and were run
+again: llama.cpp pp2048, whose earlier pass read 1219.4 (1218.5-1223.2), and mlx_lm pp8192,
+whose first run read 1338.9 (1330.4-1399.1) and whose second is in the table.
+
+```
+# FreeToken prefill, by the method of the Prefill section below (server-counted tokens 512 / 2048 / 4096 / 8192)
+PYTHONPATH=python python -m freetoken.cli serve --model ~/assets/models/qwen3.6-35b-a3b-nvfp4 --moe-backend fused --num-tokens 32768
+# FreeToken decode
+PYTHONPATH=python python benchmarks/bench_decode_moe.py --model ~/assets/models/qwen3.6-35b-a3b-nvfp4 --backend metal --decode 512 --decode-reps 5 --prefill ''
+# llama.cpp
+llama-bench -m Qwen3.6-35B-A3B-UD-Q4_K_M.gguf -p 512,2048,4096,8192 -n 128,512 -r 5
+# mlx_lm, one process per row
+python -m mlx_lm benchmark --model ~/assets/models/qwen3.6-35b-a3b-mlx -p 4096 -g 1 -n 5
+python -m mlx_lm benchmark --model ~/assets/models/qwen3.6-35b-a3b-mlx -p 4 -g 512 -n 5
+```
+
+The FreeToken prefill rows size the KV pool to the workload (`--num-tokens 32768`), as
+`llama-bench` and `mlx_lm` do. On this tree the default plan takes 183,614 KV tokens and leaves
+2.8 GiB for the forward; a 4,096-token prefill then reads 195 tok/s (137-256) and an 8,192-token
+one 340, because the machine swaps instead of failing an allocation.
+
 ## Prefill -- M4 Max, 35B NVFP4 resident (16 Sep 2026)
 
 Prefill tok/s is `(prompt_tokens(N) - prompt_tokens(base)) / (median t(N) - median t(base))`, every
@@ -34,18 +85,6 @@ Greedy ids are identical to the reference on both trees. The shape matters as mu
 before, prefill fell 78 % from 512 to 8,192 tokens (694 -> 153); after, it is flat within 1 %
 (906 -> 898). The long-prompt collapse is gone, and with it the swap thrash -- an 8,192-token chunk
 used to allocate 4.3 GiB of fp32 attention scores per full-attention layer.
-
-Against `llama-bench` on the same machine (build 89fe242, Qwen3.5-9B Q4_K_M, 5.28 GiB, 3 reps):
-
-| Test | FreeToken, 35B-A3B NVFP4 | llama.cpp, 9B Q4_K_M | ratio |
-|---|---|---|---|
-| pp512 | **906.3** | 663.31 +- 0.79 | 1.37x |
-| pp2048 | **870.0** | 658.10 +- 3.24 | 1.32x |
-| pp8192 | **897.6** | 612.01 +- 5.47 | 1.47x |
-
-Different models -- a 35B-A3B MoE with 3B active against a dense 9B -- so this is not a
-like-for-like head-to-head, and llama.cpp's peak RSS is 5.72 GiB against our 26.3 GiB. It is the
-closest comparison the checkpoints on this disk allow.
 
 ### Against MLX's own attention, at identical shapes
 
