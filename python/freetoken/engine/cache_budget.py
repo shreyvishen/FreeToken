@@ -139,6 +139,56 @@ def resolve_moe_cache_auto(
     )
 
 
+# Buffers the hyper-connection chain holds at once, each one residual-wide: R itself, the
+# normed copy and the gate inside ``GatedResidual.mix``, and ``combine``'s output.
+_HC_LIVE_COPIES = 4
+
+
+def extend_activation_bytes(config) -> int:
+    """A FLOOR under the device bytes one Metal extend allocates outside every pool. Per row:
+    the residual (times the hyper-connection live copies), the qkv buffer, the fp32 MoE staging
+    and routing tables of ``kernel/metal/nvfp4.py``, and QSA selection; per forward: the GDN
+    chunk snapshots of a snapshotting cache and the QSA score workspace. Smaller transients are
+    left to the ``(1 - memory_ratio)`` that ``_startup_kv_budget`` withholds."""
+    import torch
+
+    from freetoken.attention import AttnType
+    from freetoken.attention.metal import _LOGITS_WORKSPACE_BYTES
+    from freetoken.kernel.fla.const import CHUNK_SIZE
+    from freetoken.kvcache.linear_state_pool import ssm_state_dtype
+
+    mc = config.model_config
+    item = config.dtype.itemsize
+    i32, i64, f32 = torch.int32.itemsize, torch.int64.itemsize, torch.float32.itemsize
+    hidden = mc.hidden_size
+    streams = mc.qwen4_args.hc_count * _HC_LIVE_COPIES if mc.qwen4_args is not None else 1
+    per_row = (streams * hidden + (mc.num_qo_heads + 2 * mc.num_kv_heads) * mc.head_dim) * item
+    if mc.is_moe:
+        # flat_ids + order (int64) and route_id, route_row, route_w (4 B each), per route.
+        route = 2 * i64 + 3 * f32
+        per_row += mc.num_experts_per_tok * (
+            (mc.moe_intermediate_size + hidden) * f32 + route
+        )
+    else:
+        per_row += 2 * mc.intermediate_size * item
+    total = config.max_forward_len * per_row
+
+    group = mc.linear_attention_group()
+    if group is not None and getattr(config, "cache_type", "radix") == "hybrid_radix":
+        state = group.num_value_heads * group.key_head_dim * group.value_head_dim
+        total += div_ceil(config.max_forward_len, CHUNK_SIZE) * state * ssm_state_dtype().itemsize
+
+    qsa = next((s for s in mc.kv_cache_group_specs() if s.attn_type is AttnType.QSA), None)
+    if qsa is not None and mc.qwen4_args is not None:
+        args = mc.qwen4_args
+        # topk_values f32 + topk_blocks i64 + blocks i32, the expanded ids, the roped queries.
+        selection = (args.index_topk_blocks * (f32 + i64 + i32)
+                     + (args.index_budget + qsa.index_ratio - 1) * i32
+                     + args.index_n_heads * args.index_head_dim * item)
+        total += config.max_forward_len * selection + _LOGITS_WORKSPACE_BYTES
+    return total
+
+
 # Unified memory only: the most host memory the disk tier leaves unspent.
 MPS_MIN_FREE_BYTES = 3 * 1024**3 // 2
 
@@ -148,32 +198,52 @@ def mps_net_cache_budget_bytes(
     min_free_bytes: int = MPS_MIN_FREE_BYTES,
 ) -> int:
     """:func:`net_cache_budget_bytes` with the headroom capped at ``min_free_bytes``."""
-    # baseline_free - int(ratio * baseline_free) rather than int((1-ratio) * baseline_free):
-    # the two differ by a byte, and this one is exactly the reserve net_cache_budget_bytes
-    # keeps, so the small-box case is equal to it rather than one byte off.
+    # Not int((1 - ratio) * baseline_free): that is a byte off the reserve
+    # net_cache_budget_bytes keeps, and the small-box case must equal it exactly.
     headroom = min(baseline_free - int(memory_ratio * baseline_free), min_free_bytes)
     return baseline_free - headroom - weights_bytes - fixed_cache_size
 
 
-# Unified memory only: the KV tokens the plan may take before the bytes are better left as
-# host memory, when concurrency rather than context length is what would spend them. 65536 is
-# four 16k conversations.
-DEFAULT_MPS_KV_CAP_TOKENS = 65536
+def mps_disk_tier_plan(
+    *, baseline_free: int, weights_bytes: int, memory_ratio: float, reserved_bytes: int,
+    activation_bytes: int, arena_bytes: int, per_expert_bytes: int, row_bytes: "list[int]",
+    cache_per_page: int, num_experts: int, total_experts: int, max_slots: int,
+    kv_floor_pages: int, kv_cap_pages: int | None, state_sizes: "list[int]",
+) -> tuple[int, int, int, int]:
+    """Settle the disk tier's ``(slots, kv_pages, budget, heap_overhead)``: the activations and
+    reserved pools leave the budget before the split, then the MPS heap gap is re-priced."""
+    fixed = reserved_bytes + arena_bytes + activation_bytes
+    overhead = 0
+    for _ in range(4):
+        budget = mps_net_cache_budget_bytes(
+            memory_ratio, baseline_free, weights_bytes, fixed + overhead
+        )
+        size, pages, _overlap = plan_cache_budget(
+            budget_bytes=budget, per_expert_bytes=per_expert_bytes,
+            cache_per_page=cache_per_page, num_experts=num_experts,
+            total_experts=total_experts, prefill_overlap=False,
+            kv_reserve_pages=kv_floor_pages, max_slots=max_slots, kv_cap_pages=kv_cap_pages,
+        )
+        # Every device allocation the tier and its sibling pools make, in order: the slot
+        # banks, the staging arena, the KV slab, the GDN state.
+        sizes = [size * rb for rb in row_bytes]
+        sizes += [arena_bytes, pages * cache_per_page, *state_sizes]
+        settled = max(overhead, mps_driver_bytes(sizes) - sum(sizes))
+        if settled == overhead:
+            break
+        overhead = settled
+    return size, pages, budget, overhead
 
 
 def resolve_kv_cap_pages(
-    *, max_running_req: int, max_seq_len: int, kv_cap_tokens: int | None, page_size: int,
+    *, max_running_req: int, max_seq_len: int, kv_cap_tokens: int, page_size: int,
 ) -> int:
     """KV pages worth capping the plan at, in pages of ``page_size`` tokens: the smaller of
     what the request limits address (``max_running_req x max_seq_len``) and ``kv_cap_tokens``
     (0 or less -> off)."""
     tokens = max_running_req * max_seq_len
-    # A default of a flat 65536 made a prompt longer than that unservable whatever the box
-    # had free, which on a 262144-context model is most of the context window. One request's
-    # full context is the real floor under the ceiling; concurrency past it still pays.
-    cap = max(DEFAULT_MPS_KV_CAP_TOKENS, max_seq_len) if kv_cap_tokens is None else kv_cap_tokens
-    if cap > 0:
-        tokens = min(tokens, cap)
+    if kv_cap_tokens > 0:
+        tokens = min(tokens, kv_cap_tokens)
     return max(div_ceil(tokens, page_size), 1)
 
 

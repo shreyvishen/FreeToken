@@ -5,22 +5,17 @@ from __future__ import annotations
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(
-    not torch.backends.mps.is_available(), reason="needs an Apple GPU"
-)
-
-from freetoken.kernel.metal import (  # noqa: E402  (after the MPS guard)
+from freetoken.kernel.metal import is_available
+from freetoken.kernel.metal.nvfp4 import (
     dequant_nvfp4,
     dequant_nvfp4_dense,
     moe_decode_nvfp4,
-    moe_prefill_nvfp4,
     moe_prefill_nvfp4_grouped,
     nvfp4_gemv,
 )
+from tests.kernels._refs import SHAPES, banks, dequant_ref, moe_ref, rel, rel_norm, routing
 
-from tests.kernels._refs import (  # noqa: E402
-    SHAPES, banks, dequant_ref, moe_ref, rel, rel_norm, routing,
-)
+pytestmark = pytest.mark.skipif(not is_available(), reason="needs a torch build with MPS")
 
 SLOT0 = torch.tensor([0], dtype=torch.int32)
 
@@ -122,18 +117,6 @@ def test_decode_shared_expert():
         assert got.shape == (x.shape[0], h) and rel(got, want.cpu()) < 1e-4
 
 
-def test_prefill():
-    # dequantize the active experts, then one dense matmul per expert group
-    for h, inter in SHAPES:
-        for dtype, metric in ((torch.float32, rel), (torch.bfloat16, rel_norm)):
-            x, gu, dn, ids, weights, args = _moe_args(8, 4, 12, h, inter, seed=7)
-            got = moe_prefill_nvfp4(*args, dtype=dtype, expert_chunk=3)
-            err = metric(got, moe_ref(x, gu, dn, weights, ids))
-            assert err < 1e-2, f"h={h} inter={inter} {dtype}: {metric.__name__} {err:.3e}"
-        assert rel(moe_prefill_nvfp4(*args, dtype=torch.float32),
-                   moe_decode_nvfp4(*args).cpu()) < 1e-2
-
-
 def test_prefill_grouped():
     # one threadgroup row per expert, walking group_rows routes at a time; 1 and 8 bound
     # the ragged-run and the idle-expert clamp
@@ -152,6 +135,19 @@ def test_prefill_grouped():
     idle = moe_prefill_nvfp4_grouped(x.to("mps"), *_mps(*gu), *_mps(*dn),
                                      weights.to("mps"), ids.to("mps"))
     assert rel(idle, moe_ref(x, gu, dn, weights, ids)) < 1e-2
+
+
+def test_prefill_grouped_ignores_which_slot_an_expert_sits_in():
+    # the SSD tier hands these kernels slot ids, and slots follow the cache's history: the same
+    # experts under another numbering must give the same bits, or greedy ids follow the cache
+    h, inter = SHAPES[0]
+    for m in (12, 300):  # the row-grouped kernel, then the tiled one
+        x, gu, dn, ids, weights, args = _moe_args(16, 4, m, h, inter, seed=41)
+        perm = torch.randperm(16, generator=torch.Generator().manual_seed(42))
+        held = torch.argsort(perm)  # slot s holds expert held[s]
+        moved = [x.to("mps"), *_mps(*(b[held] for b in gu)), *_mps(*(b[held] for b in dn)),
+                 weights.to("mps"), perm[ids.long()].to(ids.dtype).to("mps")]
+        assert torch.equal(moe_prefill_nvfp4_grouped(*args), moe_prefill_nvfp4_grouped(*moved)), m
 
 
 def _ragged(m, experts, top_k, seed):
@@ -179,24 +175,17 @@ def test_prefill_tiled(m):
         # much; the engine's x is a widened bfloat16 residual and is exact (see below).
         err = rel_norm(got, moe_ref(x, gu, dn, weights, ids))
         assert err < 1e-2, f"m={m} h={h} inter={inter}: rel_norm {err:.3e}"
-        # and against the kernel it replaces, which the predicate still reaches. Naming
-        # group_rows always lands there, so below the threshold the two agree bit for bit
-        # and above it they cannot: that is what proves the predicate routed.
+        # Naming group_rows always lands on the row-grouped kernel, so below the threshold
+        # the two agree bit for bit and above it they cannot: that proves the predicate routed.
         rows = moe_prefill_nvfp4_grouped(*args, group_rows=2)
         assert rel_norm(got, rows.cpu()) < 1e-2
         assert torch.equal(got.cpu(), rows.cpu()) == (m < 256)
-
-
-def test_prefill_tiled_matches_the_grouped_kernel_on_the_engines_input():
-    # The MoE layer widens a bfloat16 residual to float32 before the call, so the tiled
-    # gate/up GEMM's bfloat activation tile rounds nothing and only the K order differs.
-    # Measured 1.3e-7 to 2.5e-7 here, against 1.5e-3 to 1.9e-3 for an x off that grid.
-    for h, inter in SHAPES:
-        _, _, _, _, _, args = _moe_args(8, 4, 512, h, inter, seed=17)
+        # The MoE layer widens a bfloat16 residual to float32, so on that input the tiled
+        # GEMM rounds nothing and only the K order differs (measured 1.3e-7 to 2.5e-7).
         args[0] = args[0].to(torch.bfloat16).float()
         err = rel_norm(moe_prefill_nvfp4_grouped(*args),
                        moe_prefill_nvfp4_grouped(*args, group_rows=2).cpu())
-        assert err < 1e-6, f"h={h} inter={inter}: rel_norm {err:.3e}"
+        assert err < 1e-6, f"m={m} h={h} inter={inter}: rel_norm {err:.3e}"
 
 
 def test_prefill_tiled_ragged_routing():

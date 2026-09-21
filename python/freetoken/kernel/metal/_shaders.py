@@ -31,10 +31,9 @@ kernel void dequant_nvfp4(
     device const uchar * scale        [[buffer(2)]],
     device const half  * glob         [[buffer(3)]],
     device const int   * slots        [[buffer(4)]],
-    device const float * lut          [[buffer(5)]],
-    constant     int   & OUT          [[buffer(6)]],
-    constant     int   & IN_PACKED    [[buffer(7)]],
-    constant     int   & NUM_BLOCKS   [[buffer(8)]],
+    constant     int   & OUT          [[buffer(5)]],
+    constant     int   & IN_PACKED    [[buffer(6)]],
+    constant     int   & NUM_BLOCKS   [[buffer(7)]],
     uint2 gid [[thread_position_in_grid]])
 {
     // gid.x = byte index inside the row, gid.y = flattened (expert, output row).
@@ -61,8 +60,8 @@ kernel void dequant_nvfp4(
     float s   = e4m3_u8_to_f32(scale[row * long(NUM_BLOCKS) + long(blk)]) * g;
 
     long base = long(pid_row) * long(IN_PACKED) * 2;
-    out[base + 2 * byte_off + 0] = OUT_T(lut[lo] * s);
-    out[base + 2 * byte_off + 1] = OUT_T(lut[hi] * s);
+    out[base + 2 * byte_off + 0] = OUT_T(E2M1[lo] * s);
+    out[base + 2 * byte_off + 1] = OUT_T(E2M1[hi] * s);
 }
 """
 
@@ -128,8 +127,8 @@ kernel void nvfp4_moe_gate_up_silu(
     // The token's activations, as float4 so the inner loop reads 16 bytes at a time.
     device const X_T4 * xs4 = (device const X_T4 *)(x + ulong(m) * KDIM);
 
-    // NR0 consecutive intermediate indices per SIMD-group (ggml's structure): one activation
-    // tile per threadgroup serves NSG*NR0 rows, so a larger NR0 cuts the tile traffic.
+    // NR0 consecutive intermediate indices per SIMD-group (ggml's structure): each lane reuses
+    // its activation words across NR0 rows, so a larger NR0 cuts the activation reads.
     const uint i0 = (tgid.x * NSG + sgitg) * NR0;
 
 #if SHARED
@@ -223,8 +222,8 @@ kernel void nvfp4_moe_down(
     // gate/up kernel. Staging them would be TOPK times larger and cap the occupancy.
     device const float4 * xs4 = (device const float4 *)(inter + ulong(m) * (RPT * KDIM));
 
-    // NR0 consecutive output rows per SIMD-group: the 16 KiB tile is loaded once per
-    // threadgroup, so serving NSG*NR0 rows from it cuts that traffic by NR0.
+    // NR0 consecutive output rows per SIMD-group: each lane reuses its activation words
+    // across NR0 rows, so a larger NR0 cuts the activation reads by NR0.
     const uint h0 = (tgid.x * NSG + sgitg) * NR0;
 
     // One lane-private accumulator per row across all TOPK routes: the route's global scale

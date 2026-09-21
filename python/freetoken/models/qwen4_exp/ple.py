@@ -382,9 +382,9 @@ def build_ple_metadata(
             torch.tensor([_state_slot(r) for r in reqs], dtype=torch.int64, **pin),
             torch.tensor([r.cached_len == 0 for r in reqs], dtype=torch.bool, **pin),
         ]
-        # stage_h2d, not a bare non_blocking: on Metal the source is unpinned and an async copy
+        # h2d, not a bare non_blocking: on Metal the source is unpinned and an async copy
         # reads freed memory once the host tensor dies
-        cu, slots, fresh = [t.to(device, non_blocking=device_backend.stage_h2d(t)) for t in host]
+        cu, slots, fresh = [device_backend.h2d(t, device) for t in host]
     context = context_pool.index_select(0, slots).long()
     context = torch.where(fresh.unsqueeze(1), context.new_full((), eos), context)
     return PLEMetadata(
@@ -718,12 +718,7 @@ class PLELayer(BaseOP):
         rolled = torch.empty_like(state)
         torch.cat([state[..., 1:], column], dim=-1, out=rolled)
         states.index_put_((meta.state_slots,), rolled.to(states.dtype))
-        # silu as sigmoid + mul_: F.silu(inplace=True) returns its own input, which the tape
-        # classifies as a view and drops
-        activated = out.to(x.dtype)
-        sigmoid = torch.empty_like(activated)
-        torch.sigmoid(activated, out=sigmoid)
-        return activated.mul_(sigmoid)
+        return F.silu(out.to(x.dtype))
 
     def _prefill_conv(
         self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor
@@ -769,7 +764,7 @@ class PLELayer(BaseOP):
         )
         if torch.cuda.is_available():
             packed = packed.pin_memory()
-        packed = packed.to(device, non_blocking=device_backend.stage_h2d(packed))
+        packed = device_backend.h2d(packed, device)
         n_out, n_state = out_index.numel(), len(lens) * state_len
         return packed[:n_out], packed[n_out : n_out + n_state], packed[n_out + n_state :]
 

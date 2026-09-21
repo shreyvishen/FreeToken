@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import torch
 
-from freetoken.kernel.metal import E2M1_VALUES
-
 # (H, I) pairs. The second is not a multiple of the 32-lane SIMD width times the
 # words-per-row stride, so the K-loop remainder and a partial lane count both run.
 SHAPES = [(256, 64), (80, 48)]
@@ -28,7 +26,7 @@ def banks(experts: int, out_rows: int, in_dim: int, seed: int):
 def dequant_ref(packed, scale, glob, slots):
     """float32 CPU oracle for dequant, sharing no arithmetic with the kernel's bit trick."""
     slots = slots.cpu().long()
-    lut = torch.tensor(E2M1_VALUES, dtype=torch.float32)
+    lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6])
     rows = packed.cpu()[slots].long()
     codes = torch.stack([lut[rows & 0xF], lut[(rows >> 4) & 0xF]], dim=-1).flatten(-2)
     blocks = scale.cpu()[slots].view(torch.float8_e4m3fn).float()

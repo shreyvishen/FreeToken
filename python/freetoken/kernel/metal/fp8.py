@@ -17,8 +17,8 @@ _SOURCE = r"""
 #define VEC {vec}
 #define NW (VEC / 4)
 
-// out[m, n] = scale[n] * sum_k x[m, k] * e4m3(w[n, k]). The activation row is read from device
-// memory, not staged: each lane reads its own slice, so staging would only cap threadgroups.
+// out[m, n] = scale[n] * sum_k x[m, k] * e4m3(w[n, k]). Except under NORM, x is read from
+// device memory: each lane reads its own slice, so staging would only cap threadgroups.
 kernel void fp8_gemv(
     device       T*     out   [[buffer(0)]],
     device const T*     x     [[buffer(1)]],
@@ -231,10 +231,10 @@ def fp8_gemv(
     *, extra_weight: torch.Tensor | None = None,
     conv: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     norm: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float] | None = None,
-    tile: tuple[int, int] | None = None, vec: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """``x [M, K] @ (e4m3(weight [N, K]) * scale [N])^T -> [M, N]`` in ``x``'s dtype, with
-    three optional fusions, each bit-identical to running its own kernel around this one:
+    three optional fusions; the conv epilogue is bit-identical to its own kernel, the other two
+    match theirs to rounding:
     ``norm = (hidden, residual, residual_out, weight, eps)`` replaces ``x`` by
     ``rmsnorm(hidden + residual) * weight`` in every threadgroup's prologue and writes
     ``hidden + residual`` to ``residual_out``; ``extra_weight [NX, K]`` (unquantized,
@@ -244,8 +244,8 @@ def fp8_gemv(
     in the epilogue, advancing the state in place."""
     m, k = x.shape
     n = weight.shape[0]
-    # No _MIN_TGS bar here: this kernel stages nothing, so a dividing tile is the pick.
-    nsg, nr0 = tile or pick_tile(_TILES, n)
+    # No _MIN_TGS bar: only the norm prologue stages, so a dividing tile is the pick.
+    nsg, nr0 = pick_tile(_TILES, n)
     rows = nsg * nr0
     out = torch.empty((m, n), dtype=x.dtype, device=x.device)
     args = [out, x, weight, scale]
@@ -266,7 +266,7 @@ def fp8_gemv(
         while len(args) < 9:
             args.append(out)   # buffers 4..8 are positional; the kernel binds none of them here
         args += [hidden, residual, residual_out, nw, float(eps)]
-    _lib(k, n, nsg, nr0, vec or _vec(k), x.dtype, nx, extra_weight.dtype if nx else None,
+    _lib(k, n, nsg, nr0, _vec(k), x.dtype, nx, extra_weight.dtype if nx else None,
          conv_spec, norm is not None).fp8_gemv(
         *args, threads=(32 * nsg * (-(-n // rows) + -(-nx // rows)), m),
         group_size=(32 * nsg, 1),

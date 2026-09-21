@@ -101,7 +101,7 @@ def _patch_env(monkeypatch, *, major=9, flashinfer=True, sgl=True):
 
     # this file describes the CUDA arch tree; the Metal candidate is pinned off
     # so the expectations hold on an Apple host too.
-    monkeypatch.setattr(engine, "is_mps", lambda: False)
+    monkeypatch.setattr(engine.device_backend, "is_mps", lambda: False)
     monkeypatch.setattr(engine, "is_sm100_family", lambda: major == 10)
     monkeypatch.setattr(engine, "is_sm90_family", lambda: major == 9)
     monkeypatch.setattr(engine, "_flashinfer_available", lambda: flashinfer)

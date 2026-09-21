@@ -11,14 +11,7 @@ include the full serving path. AIME-25 prompt, checkpoint-recommended sampling.
 python benchmarks/bench_decode_moe.py --model /path/to/model --backend offload,cpu,hybrid
 ```
 
-`--backend metal` is Darwin-only: resident experts via `--moe-backend fused`. The three
-Metal rows in `docs/benchmarks-metal-m4max.md`:
-
-```bash
-PYTHONPATH=python python benchmarks/bench_decode_moe.py --model ~/assets/models/qwen3.6-35b-a3b-nvfp4 --backend metal
-PYTHONPATH=python python benchmarks/bench_decode_moe.py --model ~/assets/models/qwen3.6-35b-a3b-nvfp4 --backend offload --cache-rate 0.25
-PYTHONPATH=python python benchmarks/bench_decode_moe.py --model ~/assets/models/qwen3.5-122b-a10b-nvfp4 --backend offload
-```
+`--backend metal` (Darwin only) and the Metal rows' commands: `docs/benchmarks-metal-m4max.md`.
 
 **`bench_load_weight_generic.py`** — expert-bank load time: serial vs parallel O_DIRECT
 vs pre-repacked FTW, each mode in its own subprocess. Linux-only; stages the FTW under

@@ -1,5 +1,4 @@
-"""NVFP4 MoE prefill on MPS: the tiled grouped GEMM against the row-grouped kernel it
-replaces at large M.
+"""NVFP4 MoE prefill on MPS: the tiled grouped GEMM against the row-grouped kernel it replaces.
 
 Synthetic, no checkpoint. Qwen3.6-35B's MoE shape by default (hidden 2048, moe_intermediate
 512, 256 experts, top-8), one layer per timed call, routing drawn uniformly so every expert
@@ -20,7 +19,7 @@ import sys
 
 import torch
 
-from freetoken.kernel.metal import moe_prefill_nvfp4_grouped
+from freetoken.kernel.metal.nvfp4 import moe_prefill_nvfp4_grouped
 
 
 def make_args(m: int, h: int, inter: int, experts: int, top_k: int, seed: int) -> list:

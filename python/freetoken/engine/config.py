@@ -44,7 +44,7 @@ class EngineConfig:
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
     # Unified memory only: ceiling on the KV tokens the one-pool plan may take, so the leftover
     # budget stays host memory instead of KV no request can address. 0 = uncapped, CUDA ignores.
-    kv_cap_tokens: int | None = 65536
+    kv_cap_tokens: int = 65536
     moe_cache_policy: str = "lru"
     # Metal only (--dense-quant-override): serve the checkpoint's unquantized dense weights as
     # fp8-e4m3 W8A16 to free memory for MoE slots. Lossy, hence "none" by default.

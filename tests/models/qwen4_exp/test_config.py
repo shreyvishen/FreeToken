@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from freetoken.attention import AttnType
 from freetoken.models.config import (
@@ -11,7 +12,7 @@ from freetoken.models.config import (
 )
 from freetoken.models.qwen4_exp.config import parse_config
 
-from .common import LOVEDHEART_NVFP4_FP8, NVIDIA_NVFP4, QWEN_FP8, RADIXARK_NVFP4
+from .common import LOVEDHEART_NVFP4_FP8, NVIDIA_NVFP4, QWEN_FP8, RADIXARK_NVFP4, requires_mps
 
 
 def _text_config():
@@ -215,3 +216,57 @@ def test_released_checkpoints_keep_the_dense_projections_bf16(quantization_confi
     quant = _quant(_hf_config(quantization_config), tmp_path)
     for prefix in DENSE_PREFIXES + BF16_PREFIXES:
         assert quant.scheme_for(prefix) is None, prefix
+
+
+# ======================================================================================
+# Engine-side resolution of the parsed config (what `ft serve` settles before the weights)
+# ======================================================================================
+
+
+def _engine_cfg(tmp_path, quantization_config=NVIDIA_NVFP4, **over):
+    """An EngineConfig over a config.json written from the shipping geometry."""
+    import json
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    hf = _hf_config(quantization_config)
+    hf.vision_config = _vision_config()
+    payload = {**vars(hf), "text_config": {**vars(hf.text_config), "model_type": "qwen4_exp_text"},
+               "vision_config": vars(hf.vision_config)}
+    (tmp_path / "config.json").write_text(json.dumps(payload))
+    return EngineConfig(model_path=str(tmp_path), tp_info=DistributedInfo(rank=0, size=1),
+                        dtype=torch.bfloat16, **over)
+
+
+@requires_mps
+def test_metal_config_resolves_the_whole_way(tmp_path, monkeypatch):
+    """`ft serve` on mps: _adjust_config settles every pool knob, and the vision tower (CUDA streams) is parsed away."""
+    from freetoken.engine.engine import _adjust_config
+
+    # a fixed 32 GiB budget, so the resident-expert check does not depend on this machine's RAM
+    monkeypatch.setattr("freetoken.kernel.backend.free_memory", lambda device=None: 32 << 30)
+    cfg = _engine_cfg(tmp_path, max_running_req=4)
+    assert cfg.active_encoders == () and cfg.served_modalities == frozenset()
+    assert not cfg.model_config.is_multimodal and not cfg.model_config.model_is_mrope
+    _adjust_config(cfg)
+    assert cfg.attention_backend == "metal"        # serves QSA on mps; qsa_sparse is triton
+    assert cfg.page_size == 64                     # a 4-token compress group never straddles it
+    assert cfg.cache_type == "hybrid_radix"        # GDN prefix reuse; PLE states ride the slots
+    assert cfg.moe_strategy == "offload"           # 63 GiB of experts never fit resident
+    assert cfg.moe_cache_auto is True              # sized against free memory at engine init
+    assert cfg.ple_backend == "disk"
+    with pytest.raises(ValueError, match="ple-backend"):
+        _adjust_config(_engine_cfg(tmp_path, ple_backend="pinned"))
+
+
+def test_the_ple_states_ride_the_linear_slots(tmp_path):
+    """The pool sizing has to see them, or the budget is short by their bytes."""
+    from freetoken.kvcache.linear_state_pool import linear_state_bytes_per_req
+    from freetoken.models.qwen4_exp.config import PLE_CONV_STATE, PLE_NGRAM_STATE
+
+    config = parse_config(_hf_config())
+    assert {spec.name for spec in config.slot_states} == {PLE_CONV_STATE, PLE_NGRAM_STATE}
+    group = config.linear_attention_group()
+    with_ple = linear_state_bytes_per_req(group, 1, torch.bfloat16, config.slot_states)
+    assert with_ple - linear_state_bytes_per_req(group, 1, torch.bfloat16) == 10240 * 9 * 2 + 2 * 4

@@ -35,6 +35,7 @@ uv run pytest tests/kvcache/         # one subsystem
 
 GPU-dependent tests skip themselves when CUDA is unavailable. Marlin NVFP4 tests
 skip unless `vllm` is importable (dedicated venv with `vllm>=0.14,<0.15`).
+Metal tests skip unless torch has MPS; on an Apple Silicon Mac the same commands run them.
 
 `needs_weights`-marked tests skip unless the env var pointing at a real local
 checkpoint is set:

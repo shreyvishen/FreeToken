@@ -150,6 +150,11 @@ def stage_h2d(host: torch.Tensor) -> bool:
     return True
 
 
+def h2d(host: torch.Tensor, device) -> torch.Tensor:
+    """``host.to(device)`` with the source staged by :func:`stage_h2d`."""
+    return host.to(device, non_blocking=stage_h2d(host))
+
+
 def mark_h2d_generation() -> None:
     """Close the generation queued so far; call at the top of a scheduler iteration."""
     global _h2d_open
@@ -228,6 +233,11 @@ def free_memory(device=None) -> int:
     physical = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
     working_set = max(min(torch.mps.recommended_max_memory(), physical - _MPS_OS_RESERVE), 0)
     return max(working_set - torch.mps.driver_allocated_memory(), 0)
+
+
+def reserved_bytes(device=None) -> int:
+    """Bytes this process holds on the accelerator: torch's caching pool on CUDA, the driver's on Metal."""
+    return torch.mps.driver_allocated_memory() if is_mps() else torch.cuda.memory_reserved(device)
 
 
 @functools.cache

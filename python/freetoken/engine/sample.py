@@ -22,10 +22,7 @@ class BatchSamplingArgs:
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    # The host tensor is unreferenced the moment this returns, so the copy has to have
-    # landed by then -- or the source has to be held until it has (backend.stage_h2d).
-    host = torch.tensor(data, dtype=dtype, pin_memory=backend.PIN_MEMORY)
-    return host.to(device, non_blocking=backend.stage_h2d(host))
+    return backend.h2d(torch.tensor(data, dtype=dtype, pin_memory=backend.PIN_MEMORY), device)
 
 
 def sample_impl(
@@ -41,8 +38,8 @@ def sample_impl(
         # Apple GPU: neither flashinfer nor triton runs here.
         import freetoken.kernel.metal.sampling as sampling
 
-        # With k a small fraction of the vocabulary, one topk and k-wide math beats the probs
-        # path, which sorts all V twice.
+        # With k a small fraction of the vocabulary, one topk beats the probs path, which
+        # sorts all V twice.
         if top_k is not None and top_k_max is not None and top_k_max * 8 <= logits.shape[-1]:
             return sampling.top_k_top_p_sample_from_logits(
                 logits, temperatures, top_k, top_p, top_k_max

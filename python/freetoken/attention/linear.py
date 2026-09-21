@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -78,28 +79,26 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
         return FLAMetadata(cu_seqlens=cu_seqlens, cache_indices=batch.linear_table_idx)
 
     # prefill: cumsum of query (extend) lengths, per-request slot + continuation flags.
-    lens = [r.extend_len for r in reqs]
-    cu_host = torch.tensor([0, *lens], dtype=torch.int64, **pin).cumsum_(0)
-    idx_host = torch.tensor([gdn_slot(r) for r in reqs], dtype=torch.int32, **pin)
-    has_init_host = torch.tensor([r.cached_len > 0 for r in reqs], dtype=torch.bool, **pin)
+    cu = [0, *itertools.accumulate(r.extend_len for r in reqs)]
+    idx = [gdn_slot(r) for r in reqs]
+    has_init = [r.cached_len > 0 for r in reqs]
+    cu_host = torch.tensor(cu, dtype=torch.int64, **pin)
+    idx_host = torch.tensor(idx, dtype=torch.int32, **pin)
+    has_init_host = torch.tensor(has_init, dtype=torch.bool, **pin)
     fresh = [gdn_slot(r) for r in reqs if r.cached_len == 0]
     fresh_host = torch.tensor(fresh, dtype=torch.int64, **pin) if fresh else None
 
     track = _build_track_metadata(reqs, cu_host, device, pin)
 
     return FLAMetadata(
-        cu_seqlens_host=cu_host.tolist(),
-        cache_indices_host=idx_host.tolist(),
-        has_initial_state_host=has_init_host.tolist(),
-        cu_seqlens=cu_host.to(device, non_blocking=device_backend.stage_h2d(cu_host)),
-        cache_indices=idx_host.to(device, non_blocking=device_backend.stage_h2d(idx_host)),
-        has_initial_state=has_init_host.to(
-            device, non_blocking=device_backend.stage_h2d(has_init_host)
-        ),
+        cu_seqlens_host=cu,
+        cache_indices_host=idx,
+        has_initial_state_host=has_init,
+        cu_seqlens=device_backend.h2d(cu_host, device),
+        cache_indices=device_backend.h2d(idx_host, device),
+        has_initial_state=device_backend.h2d(has_init_host, device),
         fresh_state_indices=(
-            fresh_host.to(device, non_blocking=device_backend.stage_h2d(fresh_host))
-            if fresh_host is not None
-            else None
+            device_backend.h2d(fresh_host, device) if fresh_host is not None else None
         ),
         **track,
     )
@@ -144,9 +143,7 @@ def _build_track_metadata(reqs, cu_host, device, pin):
         r.mamba_next_track_idx = 1 - r.mamba_next_track_idx
     if not dst:
         return empty
-    def to(xs, **kw):
-        host = torch.tensor(xs, **pin, **kw)
-        return host.to(device, non_blocking=device_backend.stage_h2d(host))
+    to = lambda xs, **kw: device_backend.h2d(torch.tensor(xs, **pin, **kw), device)
     return dict(
         track_dst=to(dst, dtype=torch.int64),
         track_h_row=to(h_row, dtype=torch.int64),

@@ -267,7 +267,7 @@ def test_auto_backend_resolution(monkeypatch):
     assert attention_backend_info("m3_sparse").page_sizes == (128,)
     # the dense leading layers take a FULL backend from the same resolver, filtered to 128-token pages
     monkeypatch.delenv("FREETOKEN_M3_INNER_BACKEND", raising=False)
-    monkeypatch.setattr("freetoken.engine.engine.is_mps", lambda: False)  # the table is CUDA's here
+    monkeypatch.setattr("freetoken.kernel.backend.is_mps", lambda: False)  # the table is CUDA's here
     assert _pick_inner_backend(128) in ("fa,fi", "fi", "triton")
 
 

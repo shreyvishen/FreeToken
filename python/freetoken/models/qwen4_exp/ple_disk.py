@@ -35,7 +35,7 @@ from .weight import (
 
 _IO_URING_ENV = "FREETOKEN_PLE_IO_URING"
 _SYNC_ENV = "FREETOKEN_PLE_SYNC"  # auto | wait | gate
-_READ_THREADS = 8  # same cap as moe/disk_cache.py: pread saturates this drive before more help
+_READ_THREADS = 8  # same cap as moe/disk_cache.py MAX_THREADS
 
 logger = init_logger(__name__)
 
@@ -303,15 +303,10 @@ class CudaDiskRowTable(_PleRuns):
 
 
 class MetalDiskRowTable(_PleRuns):
-    """``PLETableBackend`` for Apple Metal: the same data path as ``CudaDiskRowTable`` with no C++.
-
-    The n-gram hash is the uint64 numpy twin of ``PleStore::hash_rows`` (and of
-    ``NGramEmbedding.row_ids``); its rows are deduplicated, sorted by file offset and read with
-    buffered ``os.preadv`` on a small thread pool straight into an MPS-visible arena. ``lookup`` is
-    then a fixed-shape copy plus a LUT gather, which is all the decode tape has to replay -- every
-    host-side step happens in ``forward_host_ctx``, before the dispatch.
-    ``benchmarks/bench_ple_disk.py`` weighs that read against ``F_NOCACHE``, ``F_RDADVISE`` and ``mmap``.
-    """
+    """``PLETableBackend`` for Apple Metal: ``CudaDiskRowTable``'s data path with no C++. The
+    n-gram hash is the numpy twin of ``PleStore::hash_rows``; rows are deduplicated, sorted by
+    offset and ``os.preadv``-read into an MPS-visible arena in ``forward_host_ctx``, so ``lookup``
+    is a fixed-shape copy plus a LUT gather the decode tape can replay."""
 
     # rows are staged in batch order, so lookup reads only the shape of its row ids
     hashes_on_host = True
@@ -377,7 +372,7 @@ class MetalDiskRowTable(_PleRuns):
         self._arena = arena.reshape(max_tokens * self.heads, self.head_dim)
         self._dev = torch.empty(self._pinned.numel(), dtype=torch.uint8, device=self._device)
         # every fp8-e4m3 byte dequantized once, indexed by the raw byte (NaN encodings survive):
-        # a gather replaces the cast MPS lacks; the oracle's scale op keeps it bit-identical.
+        # a gather replaces the cast MPS lacks; exact at a power-of-two scale, to rounding otherwise.
         lut = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).to(dtype).to(self._device)
         self._lut = lut * self.scale if self.scale != 1.0 else lut
         self._slices: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -462,10 +457,8 @@ class MetalDiskRowTable(_PleRuns):
 
     def host_fill_batch(self, batch: Batch, use_graph: bool):
         """Stage this batch's rows. Metal has no captured WAIT to gate, so the fill is always inline."""
-        # One rule for both paths: lookup's copy off the arena is lazy (moe/disk_cache.py:236) and
-        # overlap scheduling drains nothing, so the preadv below could overwrite rows the previous
-        # dispatch is still reading. Decode would also be ordered by its readback D2H, but resting
-        # on that is an implicit contract; here the drain is free, the thread waits either way.
+        # lookup copies off the arena lazily (see DiskMoeCache._flush_rows) and overlap scheduling
+        # drains nothing, so the preadv below could overwrite rows the last dispatch still reads.
         if self._live is not None:
             device_backend.synchronize()
         if batch.is_decode:

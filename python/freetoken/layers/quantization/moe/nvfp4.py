@@ -25,7 +25,7 @@ from freetoken.utils import init_logger
 
 from ..registry import LayerKind, register_method
 from ..scheme import NVFP4_GROUP as GROUP, QuantKind
-from .base import BankSpec, ExpertView, fused_global, fused_piece, gated_epilogue_reason, global_rows, is_resident, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
+from .base import BankSpec, ExpertView, fused_global, fused_piece, gated_epilogue_reason, global_rows, limit_or_inf, MoEConfig, MoEKernel, MoEMethod
 
 logger = init_logger(__name__)
 
@@ -117,20 +117,11 @@ class MetalNvfp4MoEKernel(TritonNvfp4MoEKernel):
         return ExpertView(dict(zip(BANK_ROLES, banks)), n=layer.num_experts)
 
     def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
-        from freetoken.kernel.metal.nvfp4 import (
-            moe_decode_nvfp4,
-            moe_prefill_nvfp4,
-            moe_prefill_nvfp4_grouped,
-        )
+        from freetoken.kernel.metal.nvfp4 import moe_decode_nvfp4, moe_prefill_nvfp4_grouped
 
-        if not is_prefill:
-            kernel = moe_decode_nvfp4
-        elif is_resident(layer):
-            # Grouped: the routes are permuted into expert order so a weight word is loaded once
-            # and multiplied into several tokens.
-            kernel = moe_prefill_nvfp4_grouped
-        else:
-            kernel = moe_prefill_nvfp4
+        # Grouped: routes in expert order load a weight word once for several tokens. The SSD
+        # tier uses it too: the sum does not depend on an expert's slot, so ids ignore its history.
+        kernel = moe_prefill_nvfp4_grouped if is_prefill else moe_decode_nvfp4
         # The grouped kernels are float32 in and out; the residual stream is bf16, so
         # prefill keeps both casts. They are one launch each and off the decode path.
         out = kernel(x.float(), *_banks(view), topk_weights, topk_ids)

@@ -54,9 +54,18 @@ These families accept image input by default; pass `--text-model-only` to skip t
   and short-decode verified on an M4 Max, torch 2.10.0:
   `ft serve --model nvidia/Qwen3.6-35B-A3B-NVFP4 --moe-backend fused`
   (or omit `--moe-backend`; `auto` resolves to `fused` on Metal when the resident expert set
-  fits). No chunked GDN prefill kernel yet, so `hybrid_radix` is unavailable on mps (falls back
-  to `naive`); prefill attention is torch SDPA per request, decode attention is a paged Metal
-  kernel, and both are bounded by `max_running_req`.
+  fits). `hybrid_radix` is the default prefix cache on Metal too (GDN state snapshots at
+  64-token boundaries and at the end of each request); prefill attention is a tiled
+  online-softmax Metal kernel, decode attention a paged Metal kernel, and both are bounded by
+  `max_running_req`.
+- Qwen3.8-Flash-Next is tested on macOS with
+  [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) on a
+  36 GiB M4 Max: `ft serve --model nvidia/Qwen3.8-Flash-Next-NVFP4`. Of the checkpoint's
+  123.5 GiB, 10.5 GiB is resident. The 63.3 GiB of routed experts come from the SSD tier, and
+  the 47.7 GiB PLE n-gram table is read off the SSD each forward, 16 rows of 160 bytes per
+  token (`--ple-backend disk`, the default; `pinned` is refused on Metal, where host RAM is the
+  GPU's memory). Text only, and the MTP head is not loaded. Numbers are in
+  [benchmarks-metal-m4max.md](benchmarks-metal-m4max.md).
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into
   FreeToken's fast-load format, and `ft serve --model` auto-detects the result.
 - FTW files converted by builds before the quantization refactor may fail to load;
@@ -66,39 +75,49 @@ These families accept image input by default; pass `--text-model-only` to skip t
   with `ft checkpoint`, or add the encoder in place with [scripts/ftw_hotfix.py](ftw-hotfix.md).
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
-- Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
+- Qwen3.8-Flash-Next reads its 47.7 GiB PLE n-gram table from the checkpoint files by default
+  (`--ple-backend disk`); `--ple-backend pinned` keeps it in page-locked host RAM.
 
 ## Runtime flags on Metal (macOS)
 
 Image input is not served on Metal: the encoder towers stream their weights over CUDA
 streams, so a Metal process builds none and accepts text only.
 
-These environment variables tune the Metal (MPS) serving path. All are optional;
-each one has a default that needs no attention.
+These environment variables tune the Metal (MPS) serving path; `FREETOKEN_LOG_TOKEN_IDS` works
+on CUDA too. All are optional; each one has a default that needs no attention.
 
 | Flag | Values | Default | What it does |
 |---|---|---|---|
 | `FREETOKEN_LOG_TOKEN_IDS` | `0` or `1` | `0` (off) | Prints every sampled token id as the scheduler appends it. |
-| `FREETOKEN_LOG_MPS_MEM` | integer N | `0` (off) | Logs MPS driver pool, torch live tensors, process RSS, and swap every N decode steps. |
-| `FREETOKEN_MPS_OS_RESERVE_GB` | integer GiB | `8` | Host RAM left to macOS and every other process. Depends on the machine's RAM. |
-| `FREETOKEN_DENSE_QUANT_OVERRIDE` | `none`, `fp8` | `none` | Carries the `--dense-quant-override` choice (below) to child processes; set directly to skip the flag. |
+| `FREETOKEN_LOG_MPS_MEM` | integer N | `0` (off) | Logs MPS driver pool, torch live tensors, peak process RSS, and swap every N decode steps. |
+| `FREETOKEN_MPS_OS_RESERVE_GB` | GiB, fractions allowed | `8` | Host RAM left to macOS and every other process. Depends on the machine's RAM. |
 
-The disk tier prefetches experts from a router run one layer ahead, decided per server
-from its own miss counters (`prefetch_pays`): on when the misses per layer cost more than
-4 MiB per decode token, off otherwise.
+At batch size 1 on Qwen3.5 / Qwen3.6, the disk tier prefetches experts from a router run one
+layer ahead, decided per server from its own miss counters (`prefetch_pays`): on when the
+misses per layer cost more than 4 MiB per decode token, off otherwise.
 
 The disk tier (Metal SSD tier) takes these `ft serve` flags:
 
 | Flag | Values | Default | What it does |
 |---|---|---|---|
-| `--moe-backend` | `auto`, `fused`, `offload`, `cpu`, `hybrid` | `auto` | The MoE backend. `auto` resolves a MoE model to `offload` (or `hybrid` when a `ft bench bw` profile recommends it); `fused` must be requested explicitly. |
-| `--moe-cache-size` | integer | `0` | Number of unified MoE expert slots on GPU. |
-| `--dense-quant-override` | `none`, `fp8` | `none` | Metal only: quantizes the checkpoint's unquantized dense weights (attention q/k/v/o, GatedDeltaNet projections, dense MLP) to fp8-e4m3 at load, W8A16 at serve. Halves their bytes, freeing memory for MoE cache slots. Lossy; opt-in. |
+| `--moe-backend` | `auto`, `fused`, `offload` | `auto` | The MoE backend. `auto` resolves a MoE model to `fused` when its experts fit the `--memory-ratio` share of free memory, else to `offload`, the disk tier (NVFP4 experts only). `cpu` and `hybrid` are refused on Metal. |
+| `--moe-cache-size` | integer | `0` | Ceiling on the expert slots in unified memory; the plan may pick fewer. `0` leaves the count to the plan. |
+| `--dense-quant-override` | `none`, `fp8` | `none` | Metal only: quantizes the checkpoint's unquantized dense weights (attention q/k/v/o, GatedDeltaNet projections, the shared expert and the dense MLP) to fp8-e4m3 at load, W8A16 at serve. Halves their bytes, freeing memory for MoE cache slots. Lossy; opt-in. |
+
+The disk tier reads an expert-major repack from `<checkpoint dir>-expertmajor` when that
+directory exists: one read per expert instead of nine. Build it once with
+`python -m freetoken.checkpoint.repack_nvfp4_experts --model <checkpoint dir> --out <checkpoint dir>-expertmajor`;
+for a Hugging Face id, `<checkpoint dir>` is the downloaded snapshot.
 
 On unified memory the KV pool is capped at the smaller of 65,536 tokens and
-`max_running_requests x max_seq_len`, so the rest of the budget stays free host memory;
-`--num-pages` still wins. The disk tier pins the top tenth of each layer's experts by
-routing count against eviction: routing is skewed and the skew belongs to the weights, so
-pinning the head experts beats letting an LRU re-decide them every step.
+`max_running_requests x max_seq_len`, on the resident path as well as the disk tier, so the
+rest of the budget stays free host memory; `--num-pages` and `--num-tokens` still win. Metal
+also withholds what one chunked prefill allocates outside the pools -- the fp32 MoE staging,
+the residual streams and the GDN chunk state -- before either pool is sized. The disk tier
+pins the top tenth of each layer's experts by routing count against eviction, capped at half
+the slot cache: routing is skewed and the skew belongs to the weights, so pinning the head
+experts beats letting an LRU re-decide them every step.
 `--dense-quant-override fp8` is lossy and off by default; use it only when you need the
 freed memory for more expert slots and can accept the weight error.
+On the disk tier, `--max-seq-len-override` raises the KV pool's floor to
+`max_running_requests x max_seq_len` (still capped at 65,536 tokens), at the cost of expert slots.

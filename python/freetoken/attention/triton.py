@@ -5,9 +5,8 @@ from itertools import accumulate
 from typing import TYPE_CHECKING, List
 
 import torch
-
-from freetoken.kernel import backend as device_backend
 from freetoken.core import Batch, get_global_ctx
+from freetoken.kernel import backend as device_backend
 
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
 from .utils import BaseCaptureData
@@ -20,8 +19,7 @@ def _int32_on(values: list[int], device: torch.device) -> torch.Tensor:
     """``torch.tensor(values, int32)`` on ``device``."""
     if device.type != "mps":
         return torch.tensor(values, dtype=torch.int32, device=device)
-    host = torch.tensor(values, dtype=torch.int32)
-    return host.to(device, non_blocking=device_backend.stage_h2d(host))
+    return device_backend.h2d(torch.tensor(values, dtype=torch.int32), device)
 
 
 @dataclass

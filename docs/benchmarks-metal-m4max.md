@@ -64,9 +64,19 @@ python -m mlx_lm benchmark --model ~/assets/models/qwen3.6-35b-a3b-mlx -p 4 -g 5
 ```
 
 The FreeToken prefill rows size the KV pool to the workload (`--num-tokens 32768`), as
-`llama-bench` and `mlx_lm` do. On this tree the default plan takes 183,614 KV tokens and leaves
-2.8 GiB for the forward; a 4,096-token prefill then reads 195 tok/s (137-256) and an 8,192-token
-one 340, because the machine swaps instead of failing an allocation.
+`llama-bench` and `mlx_lm` do. The default plan now reads the same: it caps the KV pool at 65,536
+tokens and withholds a floor for the prefill's own activations, and it measures 941.3 / 883.2 /
+920.2 / 880.5 tok/s at the four lengths (5 reps) with the server at 21.1 GiB. Before the floor the
+default plan took 183,614 KV tokens and left 2.8 GiB for the forward; a 4,096-token prefill then
+read 195 tok/s (137-256) and an 8,192-token one 340, because the machine swaps instead of
+failing an allocation.
+
+On the SSD tier the floor costs expert slots. Qwen3.5-122B-A10B, 3 reps each, before this change
+and with it: decode 5.14 tok/s (4.48-5.41) and 4.69 (4.64-5.12); a 4,096-token prefill 59.1 tok/s
+and 164.2. The decode cost is the floor's. The prefill gain is mostly the grouped kernels the tier
+now runs (with the floor alone it read 79.4). Before, the server stood at 28.6 GiB after that
+prefill and its three runs took 44.8, 71.3 and 83.0 s; now 27.1 GiB and 24.8, 26.8 and 35.8 s.
+`--moe-cache-size` overrides the plan either way.
 
 ## Prefill -- M4 Max, 35B NVFP4 resident (16 Sep 2026)
 
@@ -142,3 +152,38 @@ per 64-token chunk. At 18k it is inside the run-to-run spread. `--cache-type nai
 REPS=2 N=3000 bash .notes/briefs/screen_prefix.sh 30421 p6-prefix-hybrid
 REPS=2 N=3000 bash .notes/briefs/screen_prefix.sh 30422 p6-prefix-naive --cache-type naive
 ```
+
+## Qwen3.8-Flash-Next, experts and PLE table off the SSD -- M4 Max 36 GiB (21 Sep 2026)
+
+`nvidia/Qwen3.8-Flash-Next-NVFP4`: 123.5 GiB on disk, 10.5 GiB resident, 512 experts with 10
+routed per token. One server per row, AC power, the GPU to itself, three repetitions: the figure
+is the median, the range is min-max. Decode generates 256 tokens; `pp` is prompt processing alone
+at the server-counted 512 / 2,048 / 4,096 tokens.
+
+| Expert cache | Decode tok/s | pp512 | pp2048 | pp4096 | Server memory |
+|---|---|---|---|---|---|
+| auto, 4,739 slots (19.3 %) | **9.20** (9.01-9.28) | 111.1 (109.6-117.3) | 132.5 (131.5-139.5) | 187.0 (186.9-187.1) | 25.2 GiB, 27.3 after prefill |
+| `--cache 4000` (16.3 %) | 8.46 (8.13-8.51) | 131.9 (131.3-141.2) | 202.6 (202.5-209.9) | 193.6 (190.2-193.9) | 23.4 GiB, 25.5 after prefill |
+| `--cache 3000` (12.2 %) | 7.39 (7.38-7.43) | **132.8** (130.7-138.6) | **209.8** (207.9-211.0) | **254.3** (246.3-256.9) | 20.9 GiB, 23.0 after prefill |
+
+```
+PYTHONPATH=python python benchmarks/bench_decode_moe.py --model ~/assets/models/qwen3.8-flash-next-nvfp4 --backend offload --decode 256 --decode-reps 3 --prefill 362,1459,2922
+PYTHONPATH=python python benchmarks/bench_decode_moe.py --model ~/assets/models/qwen3.8-flash-next-nvfp4 --backend offload --cache 4000 --decode 256 --decode-reps 3 --prefill 362,1459,2922
+PYTHONPATH=python python benchmarks/bench_decode_moe.py --model ~/assets/models/qwen3.8-flash-next-nvfp4 --backend offload --cache 3000 --decode 256 --decode-reps 3 --prefill 362,1459,2922
+```
+
+The auto plan is sized for decode. A decode token misses about 5 MiB of experts per layer, 2 of
+its 10, and more slots mean fewer misses. Prefill wants the opposite: a chunk streams the experts
+it routes to off the drive and through the buffer cache, and at 27 GiB of GPU memory the box has
+little left for that cache. With `--moe-cache-size 3000` on `ft serve` (`--cache 3000` here),
+prefill is 1.4x faster at 4,096 tokens and decode is 20 % slower; 4,000 slots sit between the two
+on decode, so the flag is the lever.
+
+The SSD tier's prefill runs the grouped NVFP4 kernels the resident experts use. With the older
+dequantize-and-matmul path the same three rows read 61.5, 78.8 and 110.9 tok/s at 4,096 tokens.
+The grouped kernels also sum a token's experts in the router's order, not in slot order, so greedy
+ids do not follow the expert cache's history: the 35B served from the tier at 25 % slots
+reproduces the resident path's text run after run.
+
+The PLE table is not the cost. `benchmarks/bench_ple_disk.py --folder <checkpoint>` reads a decode
+token's 16 rows in 0.32 ms and 2,048 tokens' rows in 33.5 ms from the real 47.7 GiB table.

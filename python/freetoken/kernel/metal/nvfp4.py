@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
 from freetoken.kernel.metal._shaders import (
     DEQUANT_SRC,
@@ -17,11 +16,6 @@ from freetoken.kernel.metal._shaders import (
 )
 
 from .shaders import MAX_TG_FLOATS, compile, msl_type, pick_tile
-
-# E2M1 value table by 4-bit code. The GEMVs carry their own MSL copy; dequant takes this.
-E2M1_VALUES = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
-]
 
 
 def as_e4m3_bytes(scale: torch.Tensor) -> torch.Tensor:
@@ -54,9 +48,8 @@ def dequant_nvfp4(
 
     lib = compile(specialize(DEQUANT_SRC, OUT_T=msl_type(dtype)))
     lib.dequant_nvfp4(
-        out, packed, scale, glob, slots.to(torch.int32),
-        torch.tensor(E2M1_VALUES, dtype=torch.float32, device=packed.device), out_rows, in_packed,
-        num_blocks, threads=(in_packed, n * out_rows), group_size=(64, 1),
+        out, packed, scale, glob, slots.to(torch.int32), out_rows, in_packed, num_blocks,
+        threads=(in_packed, n * out_rows), group_size=(64, 1),
     )
     return out
 
@@ -76,7 +69,6 @@ def nvfp4_gemv(
     x: torch.Tensor, packed: torch.Tensor, scale: torch.Tensor, glob: torch.Tensor, *,
     swiglu: bool = False, gate: torch.Tensor | None = None,
     side_gate_weight: torch.Tensor | None = None, out_dtype: torch.dtype | None = None,
-    tile: tuple[int, int] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """``out[m, n] = sum_k x[m, k] * weight[n, k]`` straight off one NVFP4 bank: x ``[M,
     K]``, packed ``[N, K//2]`` uint8, scale ``[N, K//16]``, glob ``[N]`` fp16 -> ``[M,
@@ -106,7 +98,7 @@ def nvfp4_gemv(
     if gate is not None and gate.numel() != m:
         raise ValueError(f"gate has {gate.numel()} elements, expected one per row ({m})")
 
-    nsg, nr0 = tile or _tile(o, m)
+    nsg, nr0 = _tile(o, m)
     rows = nsg * nr0
     out = torch.empty((m, o), dtype=out_dtype, device=x.device)
     args = [out, x, packed.view(torch.int32), as_e4m3_bytes(scale), glob]
@@ -138,8 +130,7 @@ def moe_decode_nvfp4(
     gate_up_global: torch.Tensor, down_packed: torch.Tensor, down_scale: torch.Tensor,
     down_global: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor, *,
     base: torch.Tensor | None = None, shared: tuple[torch.Tensor, ...] | None = None,
-    out_dtype: torch.dtype | None = None, tile_gate_up: tuple[int, int] | None = None,
-    tile_down: tuple[int, int] | None = None,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Routed-expert MoE for decode: x ``[M, H]``, topk_weights/topk_ids ``[M, TOP_K]`` ->
     ``[M, H]`` in two kernels, a gate/up GEMV with SiLU-mul fused and a down GEMV that
@@ -183,7 +174,7 @@ def moe_decode_nvfp4(
         dn_args = [s_dn_p.view(torch.int32), as_e4m3_bytes(s_dn_s), s_dn_g, sgate.to(out_dtype)]
 
     inter_buf = torch.empty((m, rpt, inter), dtype=torch.float32, device=dev)
-    nsg_i, nr0_i = tile_gate_up or _tile(inter, m * rpt)
+    nsg_i, nr0_i = _tile(inter, m * rpt)
     rows_i = nsg_i * nr0_i
     compile(specialize(GATE_UP_SRC, KDIM=h, INTER=inter, NSG=nsg_i, NR0=nr0_i,
                        X_T=msl_type(x.dtype), X_T4=msl_type(x.dtype) + "4",
@@ -195,7 +186,7 @@ def moe_decode_nvfp4(
     )
 
     out = torch.empty((m, h), dtype=out_dtype, device=dev)
-    nsg_h, nr0_h = tile_down or _tile(h, m)
+    nsg_h, nr0_h = _tile(h, m)
     rows_h = nsg_h * nr0_h
     args = [out, inter_buf, dn_words, as_e4m3_bytes(down_scale), down_global, ids, weights]
     if base is not None:
@@ -211,45 +202,6 @@ def moe_decode_nvfp4(
         threads=(32 * nsg_h * -(-h // rows_h), m),
         group_size=(32 * nsg_h, 1),
     )
-    return out
-
-
-def moe_prefill_nvfp4(
-    x: torch.Tensor, gate_up_packed: torch.Tensor, gate_up_scale: torch.Tensor,
-    gate_up_global: torch.Tensor, down_packed: torch.Tensor, down_scale: torch.Tensor,
-    down_global: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor, *,
-    dtype: torch.dtype = torch.bfloat16, expert_chunk: int = 16,
-) -> torch.Tensor:
-    """Prefill MoE: dequantize the active experts, ``expert_chunk`` at a time, and matmul
-    each expert's token group."""
-    m, h = x.shape
-    top_k = topk_ids.shape[1]
-    inter = gate_up_packed.shape[1] // 2
-    out = torch.zeros((m, h), dtype=torch.float32, device=x.device)
-
-    flat_ids = topk_ids.reshape(-1).to(torch.int64)
-    flat_w = topk_weights.reshape(-1).float()
-    order = torch.argsort(flat_ids)
-    sorted_ids = flat_ids[order]
-    active, counts = torch.unique(sorted_ids, return_counts=True)
-    # Each expert's routes are one contiguous run of `order` delimited by the cumulative
-    # counts, so slicing by them syncs once here rather than once per expert.
-    bounds = torch.cat([counts.new_zeros(1), counts.cumsum(0)]).tolist()
-    rows_all = order // top_k              # route -> token row
-    xc = x.to(dtype)
-
-    for start in range(0, active.numel(), expert_chunk):
-        slots = active[start:start + expert_chunk].to(torch.int32)
-        gu = dequant_nvfp4(gate_up_packed, gate_up_scale, gate_up_global, slots, dtype=dtype)
-        dn = dequant_nvfp4(down_packed, down_scale, down_global, slots, dtype=dtype)
-        for j in range(slots.numel()):
-            lo, hi = bounds[start + j], bounds[start + j + 1]
-            routes = order[lo:hi]
-            rows = rows_all[lo:hi]
-            gate_up = F.linear(xc.index_select(0, rows), gu[j])
-            act = F.silu(gate_up[:, :inter]) * gate_up[:, inter:]
-            y = F.linear(act, dn[j]).float() * flat_w[routes].unsqueeze(1)
-            out.index_add_(0, rows, y)
     return out
 
 
@@ -270,13 +222,13 @@ def moe_prefill_nvfp4_grouped(
     x: torch.Tensor, gate_up_packed: torch.Tensor, gate_up_scale: torch.Tensor,
     gate_up_global: torch.Tensor, down_packed: torch.Tensor, down_scale: torch.Tensor,
     down_global: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor, *,
-    group_rows: int | None = None, tile_gate_up: tuple[int, int] | None = None,
-    tile_down: tuple[int, int] | None = None,
+    group_rows: int | None = None,
 ) -> torch.Tensor:
-    """Grouped-by-expert prefill MoE: same contract and same bytes as
-    :func:`moe_prefill_nvfp4`, in two custom launches and with no bf16 copy of any expert.
-    Past ``_TILED_MIN_M`` tokens the launches are tiled GEMMs on the matrix units; naming any
-    of the row-grouped kernel's own knobs keeps that kernel instead."""
+    """Grouped-by-expert prefill MoE: :func:`moe_decode_nvfp4`'s contract in two custom
+    launches, with no bf16 copy of any expert. Past ``_TILED_MIN_M`` tokens the launches are
+    tiled GEMMs on the matrix units; naming ``group_rows`` keeps the row-grouped kernel."""
+    # the tiled gate/up stages activations as bfloat, exact on a widened bf16 residual only
+    tiled = x.dtype != torch.float16 and not group_rows
     x = x.contiguous().float()
     m, h = x.shape
     top_k = topk_ids.shape[1]
@@ -301,7 +253,7 @@ def moe_prefill_nvfp4_grouped(
     route_row = torch.div(order, top_k, rounding_mode="floor").to(torch.int32)
     route_w = topk_weights.reshape(-1).float().contiguous()
 
-    if m >= _TILED_MIN_M and not (group_rows or tile_gate_up or tile_down):
+    if m >= _TILED_MIN_M and tiled:
         inter_buf = torch.empty((routes, inter), dtype=torch.float32, device=dev)
         compile(specialize(MOE_TILED_SRC, KDIM=h, NDIM=inter, GATE_UP=1)).nvfp4_moe_tiled(
             inter_buf, x, gate_up_packed.view(torch.int32), as_e4m3_bytes(gate_up_scale),
@@ -326,7 +278,7 @@ def moe_prefill_nvfp4_grouped(
     nm = group_rows or min(_MAX_GROUP_ROWS, 1 << (avg.bit_length() - 1))
 
     inter_buf = torch.empty((routes, inter), dtype=torch.float32, device=dev)
-    nsg_i, nr0_i = tile_gate_up or _tile(inter, experts)
+    nsg_i, nr0_i = _tile(inter, experts)
     rows_i = nsg_i * nr0_i
     compile(specialize(GATE_UP_GROUPED_SRC, KDIM=h, INTER=inter, NSG=nsg_i, NR0=nr0_i,
                        NM=nm)).nvfp4_moe_gate_up_silu_grouped(
@@ -336,10 +288,10 @@ def moe_prefill_nvfp4_grouped(
         group_size=(32 * nsg_i, 1),
     )
 
-    # [R, H] in route order, so the top_k reduction is a plain sum over a view --
-    # deterministic, unlike the index_add_ the dequantize path needs.
+    # [R, H] in route order, so the top_k reduction is a plain sum over a view, which is
+    # deterministic where an index_add_ would not be.
     parts = torch.empty((routes, h), dtype=torch.float32, device=dev)
-    nsg_h, nr0_h = tile_down or _tile(h, experts)
+    nsg_h, nr0_h = _tile(h, experts)
     rows_h = nsg_h * nr0_h
     compile(specialize(DOWN_GROUPED_SRC, KDIM=inter, HDIM=h, NSG=nsg_h, NR0=nr0_h,
                        NM=nm)).nvfp4_moe_down_grouped(

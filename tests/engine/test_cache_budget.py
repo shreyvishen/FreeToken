@@ -8,10 +8,12 @@ import torch
 import os
 
 from freetoken.engine.cache_budget import (
-    DEFAULT_MPS_KV_CAP_TOKENS, MPS_MIN_FREE_BYTES, expert_bytes_per_slot, mps_driver_bytes,
-    mps_net_cache_budget_bytes, net_cache_budget_bytes, plan_cache_budget, required_bytes,
-    resolve_kv_cap_pages, resolve_kv_floor_pages, resolve_moe_cache_auto)
+    MPS_MIN_FREE_BYTES, expert_bytes_per_slot,
+    extend_activation_bytes, mps_driver_bytes, mps_net_cache_budget_bytes,
+    net_cache_budget_bytes, plan_cache_budget, required_bytes, resolve_kv_cap_pages,
+    resolve_kv_floor_pages, resolve_moe_cache_auto)
 from freetoken.engine.engine import _pin_budget_bytes
+from freetoken.kernel.backend import is_mps
 
 
 def test_moe_priority_fills_experts_up_to_total():
@@ -141,7 +143,7 @@ def _dsv4_adjust_cfg(**over):
         moe_cache_rate = None
         moe_strategy = "offload"
         max_running_req = 1
-        kv_cap_tokens = None
+        kv_cap_tokens = 0
         cuda_graph_max_bs = 1
         cuda_graph_bs = [1]
         max_seq_len = 1024
@@ -217,7 +219,7 @@ def test_adjust_config_resolves_num_tokens_generic():
         moe_cache_rate = None
         moe_strategy = "auto"
         max_running_req = 4
-        kv_cap_tokens = None
+        kv_cap_tokens = 0
         cuda_graph_max_bs = 2
         cuda_graph_bs = [1, 2]
         max_seq_len = 1024
@@ -259,7 +261,7 @@ def test_mha_kv_cost_simple_full_attention():
         page_size = 16
         max_running_req = 4
         max_seq_len = 262_144
-        kv_cap_tokens = None
+        kv_cap_tokens = 0
         swa_full_tokens_ratio = 0.2
         swa_num_pages_override = None
         model_config = StubModelConfig()
@@ -297,7 +299,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         page_size = 16
         max_running_req = 4
         max_seq_len = 262_144
-        kv_cap_tokens = None
+        kv_cap_tokens = 0
         num_page_override = None   # --num-tokens unset: the cap is the plan's own
         hybrid_swa_cache_mode = "auto"
         memory_ratio = 0.9
@@ -455,7 +457,7 @@ def _generic_rotary_cfg(max_position, override):
         moe_cache_rate = None
         moe_strategy = "auto"
         max_running_req = 4
-        kv_cap_tokens = None
+        kv_cap_tokens = 0
         cuda_graph_max_bs = 2
         cuda_graph_bs = [1, 2]
         max_seq_len = 1024
@@ -524,14 +526,9 @@ _PLAN = dict(per_expert_bytes=PER_EXPERT, cache_per_page=PER_PAGE, num_experts=2
 def test_resolve_kv_cap_pages_takes_the_smaller_bound():
     cap = lambda reqs, seq, tok, page: resolve_kv_cap_pages(
         max_running_req=reqs, max_seq_len=seq, kv_cap_tokens=tok, page_size=page)
-    # request limits bind; the token ceiling binds; an explicit ceiling wins; 0 turns it off
-    assert (cap(2, 4096, None, 16), cap(4, 16_384, None, 1), cap(4, 262_144, 4096, 1),
-            cap(4, 262_144, 0, 1)) == (512, DEFAULT_MPS_KV_CAP_TOKENS, 4096, 4 * 262_144)
-    # A single request's own context always fits: the default ceiling rises to meet a long
-    # model rather than leaving most of its window unservable. Concurrency past that one
-    # context still pays the flat default, which is the ceiling's whole job.
-    assert (cap(4, 262_144, None, 1), cap(16, 8192, None, 1)) == (262_144,
-                                                                  DEFAULT_MPS_KV_CAP_TOKENS)
+    # request limits bind; the token ceiling binds; 0 turns it off
+    assert (cap(2, 4096, 65536, 16), cap(4, 16_384, 65536, 1), cap(4, 262_144, 4096, 1),
+            cap(4, 262_144, 0, 1)) == (512, 65536, 4096, 4 * 262_144)
 
 
 def test_mps_headroom_is_absolute_on_a_big_box_and_the_ratio_on_a_small_one():
@@ -544,7 +541,7 @@ def test_mps_headroom_is_absolute_on_a_big_box_and_the_ratio_on_a_small_one():
 
 
 def test_kv_floor_costs_the_122b_slots_it_can_name():
-    cap = resolve_kv_cap_pages(max_running_req=4, max_seq_len=20480, kv_cap_tokens=None, page_size=1)
+    cap = resolve_kv_cap_pages(max_running_req=4, max_seq_len=20480, kv_cap_tokens=65536, page_size=1)
     floor = resolve_kv_floor_pages(max_running_req=4, max_seq_len=20480, page_size=1, kv_cap_pages=cap,
                                    max_seq_len_override=20480, kv_reserve_tokens=8192)
     plan = lambda r: plan_cache_budget(budget_bytes=int(17.88 * GIB), kv_reserve_pages=r,
@@ -574,13 +571,11 @@ def test_mps_driver_bytes_prices_the_122b_disk_tiers_gigabyte_heap():
     assert (sum(sizes), mps_driver_bytes(sizes)) == (19962335232, 20176699392)
 
 
-def test_num_tokens_override_raises_the_kv_plan_cap(monkeypatch):
-    """--num-tokens is handed to the KV pool verbatim (solve_num_pages), so the plan has to
-    size the expert slots against that same number; a cap below it over-commits the budget."""
-    import freetoken.engine.engine as engine_mod
+@pytest.mark.skipif(not is_mps(), reason="the KV plan cap is the unified-memory plan's")
+def test_num_tokens_override_raises_the_kv_plan_cap():
+    """--num-tokens reaches the KV pool verbatim, so the plan must size the slots against it."""
     from freetoken.engine.engine import Engine
 
-    monkeypatch.setattr(engine_mod, "is_mps", lambda: True)
     engine = Engine.__new__(Engine)  # bypass __init__/GPU
 
     class Cfg:
@@ -595,5 +590,84 @@ def test_num_tokens_override_raises_the_kv_plan_cap(monkeypatch):
     Cfg.num_page_override = 4_096                         # a small request never lowers it
     assert engine._kv_cap_pages(Cfg(), 1) == 65_536
 
-    monkeypatch.setattr(engine_mod, "is_mps", lambda: False)
-    assert engine._kv_cap_pages(Cfg(), 1) is None         # CUDA keeps the greedy split
+
+# ---- the Metal one-pool plan: the extend's activations, the KV floor, the pin set ----
+
+# Flash-Next's shipped geometry, at the byte figures its safetensors headers carry.
+FN = dict(hidden=2560, moe_intermediate=640, experts=512, layers=48, weights=int(9.22 * GIB))
+
+
+def _plan(**over):
+    """The real disk-tier planner on Flash-Next's numbers; ``over`` perturbs one input."""
+    from freetoken.engine.cache_budget import mps_disk_tier_plan
+    from freetoken.kernel.aot_models import expert_bank_row_bytes
+
+    rows = list(expert_bank_row_bytes("nvfp4", FN["hidden"], FN["moe_intermediate"]).values())
+    args = dict(
+        baseline_free=28 * GIB, weights_bytes=FN["weights"], memory_ratio=0.9,
+        reserved_bytes=int(2.7 * GIB), activation_bytes=int(0.85 * GIB),
+        arena_bytes=32 * sum(rows), per_expert_bytes=sum(rows), row_bytes=rows,
+        cache_per_page=1_622_016, num_experts=FN["experts"],
+        total_experts=FN["layers"] * FN["experts"], max_slots=FN["layers"] * FN["experts"],
+        kv_floor_pages=128, kv_cap_pages=1024, state_sizes=[],
+    )
+    args.update(over)
+    _plan.per_expert = sum(rows)
+    return mps_disk_tier_plan(**args)
+
+
+def test_the_plan_reserves_the_extend_before_slots_and_pages():
+    """Raising the activations must come off the budget the two pools are split from, not out
+    of what they leave over -- a version that subtracted it afterwards would not move either.
+    And however tight the box, the KV floor and the tier's decode slot survive."""
+    slots, pages, budget, _ = _plan()
+    fewer, fewer_pages, budget2, _ = _plan(activation_bytes=int(0.85 * GIB) + 2 * GIB)
+    assert budget2 <= budget - 2 * GIB                    # withheld, plus any heap it moves
+    assert fewer < slots and fewer_pages <= pages
+    tight, tight_pages, tight_budget, _ = _plan(baseline_free=18 * GIB)
+    assert tight_pages >= 128 and tight >= FN["experts"] + 1
+    assert required_bytes(tight, tight_pages, _plan.per_expert, 1_622_016) <= tight_budget
+
+
+def _mc(**over):
+    """A duck-typed ModelConfig for the pure byte arithmetic; `over` picks the feature."""
+    mc = dict(hidden_size=2048, num_qo_heads=32, num_kv_heads=4, head_dim=128, qwen4_args=None,
+              is_moe=True, num_experts_per_tok=8, moe_intermediate_size=768,
+              intermediate_size=6144, linear_attention_group=lambda: None,
+              kv_cache_group_specs=lambda: ())
+    mc.update(over)
+    return SimpleNamespace(**mc)
+
+
+def _act(mc, rows=8192, cache_type="naive"):
+    return extend_activation_bytes(SimpleNamespace(
+        model_config=mc, dtype=torch.bfloat16, max_forward_len=rows, cache_type=cache_type))
+
+
+def test_extend_activations_charge_each_term_the_forward_holds():
+    """Each term of the extend floor, alone: a regression in one moves only its own delta."""
+    from freetoken.attention import AttnType
+    from freetoken.attention.metal import _LOGITS_WORKSPACE_BYTES
+    from freetoken.utils import div_ceil
+
+    rows, bf16 = 8192, torch.bfloat16.itemsize
+    # kernel/metal/nvfp4.py stages inter_buf and parts in fp32 whatever the model dtype is
+    staging = rows * 8 * (768 + 2048)
+    assert _act(_mc()) > staging * 4 > staging * bf16
+    # models/qwen3_moe never sets moe_enabled, so the MoE branch must key on is_moe
+    per_row = _act(_mc(moe_enabled=False)) // rows
+    assert per_row > 8 * (2048 + 768) * 4 and per_row > 4 * 6144
+    # a snapshotting cache keeps one recurrent chunk-state per CHUNK_SIZE rows
+    group = SimpleNamespace(num_value_heads=32, key_head_dim=128, value_head_dim=128)
+    mc = _mc(linear_attention_group=lambda: group)
+    assert _act(mc, rows, "hybrid_radix") - _act(mc) == div_ceil(rows, 64) * 32 * 128 * 128 * 4
+    # GatedResidual.mix holds R, the normed copy and the gate at once; combine adds a fourth
+    args = SimpleNamespace(hc_count=4, index_topk_blocks=512, index_budget=2048,
+                           index_n_heads=4, index_head_dim=128)
+    plain = _mc(qwen4_args=args)
+    assert _act(plain) - _act(_mc()) == rows * (4 * 4 - 1) * 2048 * bf16
+    # attention/metal.py caches the QSA selection buffers; a model with no index pays nothing
+    qsa = _mc(qwen4_args=args, kv_cache_group_specs=lambda: (
+        SimpleNamespace(attn_type=AttnType.QSA, index_ratio=4),))
+    selection = 512 * (4 + 8 + 4) + (2048 + 3) * 4 + 4 * 128 * bf16
+    assert _act(qsa) - _act(plain) == rows * selection + _LOGITS_WORKSPACE_BYTES
