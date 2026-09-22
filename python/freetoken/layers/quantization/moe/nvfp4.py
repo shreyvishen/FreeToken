@@ -119,13 +119,12 @@ class MetalNvfp4MoEKernel(TritonNvfp4MoEKernel):
     def apply(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, is_prefill: bool):
         from freetoken.kernel.metal.nvfp4 import moe_decode_nvfp4, moe_prefill_nvfp4_grouped
 
+        if not is_prefill:
+            return moe_decode_nvfp4(x, *_banks(view), topk_weights, topk_ids)
         # Grouped: routes in expert order load a weight word once for several tokens. The SSD
         # tier uses it too: the sum does not depend on an expert's slot, so ids ignore its history.
-        kernel = moe_prefill_nvfp4_grouped if is_prefill else moe_decode_nvfp4
-        # The grouped kernels are float32 in and out; the residual stream is bf16, so
-        # prefill keeps both casts. They are one launch each and off the decode path.
-        out = kernel(x.float(), *_banks(view), topk_weights, topk_ids)
-        return out.to(x.dtype)
+        # It widens x itself: x keeps its dtype so an fp16 residual skips the bf16-staged tiled GEMM.
+        return moe_prefill_nvfp4_grouped(x, *_banks(view), topk_weights, topk_ids).to(x.dtype)
 
     def apply_fused(self, layer, x, topk_weights, topk_ids, view: ExpertView, *, base=None, shared=None):
         """The decode kernels with the layer's neighbours folded into their epilogues."""

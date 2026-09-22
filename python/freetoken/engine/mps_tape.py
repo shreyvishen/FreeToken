@@ -10,6 +10,7 @@ import torch
 from torch.overrides import TorchFunctionMode
 
 from freetoken.kernel import backend as device_backend
+from freetoken.kernel.metal import shaders
 
 
 class TapeUnsupported(RuntimeError):
@@ -89,7 +90,8 @@ class _Recorder(TorchFunctionMode):
     def __torch_function__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         out = func(*args, **kwargs)
-        self._tape._note(func, args, kwargs, out)
+        if shaders.recording():  # not inside a host step, which the tape keeps whole
+            self._tape._note(func, args, kwargs, out)
         return out
 
 
@@ -104,13 +106,12 @@ class DecodeTape:
 
     @classmethod
     def record(cls, fn) -> "DecodeTape":
-        from freetoken.kernel.metal import shaders
-
         tape = cls()
         real_flush = device_backend.flush
 
         def flush() -> None:
-            tape._ops.append(real_flush)
+            if shaders.recording():
+                tape._ops.append(real_flush)
             real_flush()
 
         device_backend.flush = flush

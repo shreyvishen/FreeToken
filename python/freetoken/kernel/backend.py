@@ -3,7 +3,8 @@
 When flashinfer / sgl_kernel are installed the call-sites use their fused CUDA
 ops; otherwise they fall back to the pure-Triton kernels in
 ``freetoken.kernel.triton``. ``find_spec`` only checks that the package is
-importable (no import side effects), and the result is cached.
+importable (no import side effects), and the result is cached. Below them sits the
+device seam: the CUDA/MPS differences the engine needs, in one place.
 """
 from __future__ import annotations
 
@@ -76,7 +77,7 @@ def is_cuda() -> bool:
 
 @functools.cache
 def is_mps() -> bool:
-    """Apple Metal, and no CUDA: every Metal branch in the engine hangs off this probe."""
+    """Apple Metal, and no CUDA."""
     return not is_cuda() and torch.backends.mps.is_available()
 
 
@@ -167,6 +168,22 @@ def release_h2d_staging() -> None:
     """Drop a closed generation once a synchronized event proves the device passed it."""
     if len(_h2d_closed) >= 2:
         _h2d_closed.pop(0).clear()
+
+
+def host_step(fn):
+    """A method that reads device data on the host at every decode step (the SSD tier's routing):
+    on Metal a recording decode tape keeps the call itself and replays it between the launches
+    around it. A plain call everywhere else."""
+
+    @functools.wraps(fn)
+    def step(*args, **kwargs):
+        if not is_mps():
+            return fn(*args, **kwargs)
+        from freetoken.kernel.metal import shaders
+
+        return shaders.run_host_step(fn, args, kwargs)
+
+    return step
 
 
 def device_type() -> str:

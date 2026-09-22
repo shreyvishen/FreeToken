@@ -109,8 +109,8 @@ class ZeroTable:
         self.num_rows = int(num_rows)
         self.head_dim = head_dim
         self.dtype = dtype
-        # The lookup never reads the ids, so on Metal -- where the device hash is not
-        # recordable -- this table wants them hashed on the host, like the disk table.
+        # The lookup never reads the ids, so on Metal it skips the device hash, which the
+        # decode tape cannot record (the flag the disk table sets for its own reason).
         self.hashes_on_host = device_backend.is_mps()
 
     def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
@@ -734,8 +734,9 @@ class PLELayer(BaseOP):
 
         state = self._read_state(meta, states, x.dtype)
         history = x.new_empty(width, x.shape[0] + num_reqs * self.state_len)
-        history.index_copy_(1, state_index, state.permute(1, 0, 2).reshape(width, -1))
-        history.index_copy_(1, out_index + self.state_len, x.transpose(0, 1).contiguous())
+        # index_put_, not index_copy_ (O(destination) on MPS)
+        history[:, state_index] = state.permute(1, 0, 2).reshape(width, -1)
+        history[:, out_index + self.state_len] = x.transpose(0, 1)
 
         out = F.conv1d(
             history.unsqueeze(0), self.conv1d.weight, groups=width, dilation=self.dilation

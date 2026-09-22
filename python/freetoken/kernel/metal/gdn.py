@@ -105,19 +105,6 @@ def _lib(source: str, header: str, **fmt: int):
     return compile(header + (source.format(**fmt) if fmt else source))
 
 
-def l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Same normalisation the reference applies to q and k."""
-    return x * torch.rsqrt(x.float().pow(2).sum(-1, keepdim=True) + eps).to(x.dtype)
-
-
-def _l2_supported(x: torch.Tensor) -> bool:
-    return (
-        is_available()
-        and x.device.type == "mps"
-        and x.dtype in (torch.float32, torch.float16, torch.bfloat16)
-    )
-
-
 def gdn_recurrent_metal(
     q: torch.Tensor,        # [B, T, Hk, Dk]
     k: torch.Tensor,        # [B, T, Hk, Dk]
@@ -128,7 +115,6 @@ def gdn_recurrent_metal(
     state_source: torch.Tensor,  # [num_slots, Hv, Dk, Dv], updated in place
     indices: torch.Tensor,       # [B] int32 slot per request
     scale: float,
-    use_qk_l2norm: bool = True,
 ) -> torch.Tensor:
     """Gated delta rule over T steps on the GPU, one kernel launch."""
     b, t_len, hk, dk = q.shape
@@ -142,17 +128,11 @@ def gdn_recurrent_metal(
             f"state {tuple(state_source.shape)} does not match (*, {hv}, {dk}, {dv})"
         )
 
-    if use_qk_l2norm and _l2_supported(q) and _l2_supported(k):
-        # One launch each with the scale folded in, against six per tensor in torch.
-        from .norm import l2norm_metal
+    # One launch each with the scale folded in, against six per tensor in torch.
+    from .norm import l2norm_metal
 
-        q = l2norm_metal(q.contiguous(), post_scale=scale).to(v.dtype)
-        k = l2norm_metal(k.contiguous()).to(v.dtype)
-    else:
-        if use_qk_l2norm:
-            q = l2norm(q)
-            k = l2norm(k)
-        q = (q.float() * scale).to(v.dtype)
+    q = l2norm_metal(q.contiguous(), post_scale=scale).to(v.dtype)
+    k = l2norm_metal(k.contiguous()).to(v.dtype)
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
@@ -171,43 +151,6 @@ def gdn_recurrent_metal(
         group_size=(32, _TG_Y, 1),
     )
     return y
-
-
-def gdn_recurrent_torch(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, *,
-    state_source: torch.Tensor, indices: torch.Tensor, scale: float, use_qk_l2norm: bool = True,
-) -> torch.Tensor:
-    """Pure-torch twin of :func:`gdn_recurrent_metal`, same signature and same in-place state
-    update: ``gdn_reference.recurrent_gated_delta_rule``'s loop with the state read from
-    and written back to the pool."""
-    b, t_len, hk, dk = q.shape
-    hv, dv = v.shape[2], v.shape[3]
-    if use_qk_l2norm:
-        q = l2norm(q)
-        k = l2norm(k)
-    q, k, v_f = q.float() * scale, k.float(), v.float()
-    if hv != hk:
-        rep = hv // hk
-        q = q.repeat_interleave(rep, dim=2)
-        k = k.repeat_interleave(rep, dim=2)
-    g, beta = g.float(), beta.float()
-
-    idx = indices.to(torch.long)
-    state = state_source[idx].float()  # [B, Hv, Dk, Dv]
-    out = torch.empty((b, t_len, hv, dv), dtype=torch.float32, device=v.device)
-    for i in range(t_len):
-        q_t, k_t, v_t = q[:, i], k[:, i], v_f[:, i]
-        g_t = g[:, i].exp().unsqueeze(-1).unsqueeze(-1)
-        beta_t = beta[:, i].unsqueeze(-1)
-        state = state * g_t
-        kv_mem = (state * k_t.unsqueeze(-1)).sum(dim=-2)
-        delta = (v_t - kv_mem) * beta_t
-        state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
-        out[:, i] = (state * q_t.unsqueeze(-1)).sum(dim=-2)
-    # index_put_, not index_copy_: see kernel/metal/ops.py:store_cache (MPS index_copy_
-    # is O(destination), not O(indices)).
-    state_source.index_put_((idx,), state.to(state_source.dtype))
-    return out.to(v.dtype)
 
 
 # --- the sigmoid/softplus gating ---------------------------------------------
@@ -296,13 +239,11 @@ def gdn_decode_metal(
     state_source: torch.Tensor,
     indices: torch.Tensor,
     scale: float,
-    use_kernel: bool = True,
 ) -> torch.Tensor:
     """Single-token decode step, signature-compatible with ``gdn_decode_fla``."""
     g, beta = gate_params(a, b, A_log, dt_bias)
     bs = v.shape[1]
-    run = gdn_recurrent_metal if use_kernel else gdn_recurrent_torch
-    y = run(
+    y = gdn_recurrent_metal(
         q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1), g.reshape(bs, 1, -1),
         beta.reshape(bs, 1, -1), state_source=state_source, indices=indices, scale=scale,
     )
@@ -320,19 +261,18 @@ def gdn_prefill_metal(
     indices: torch.Tensor,
     cu_seqlens: torch.Tensor,
     scale: float,
-    use_kernel: bool = True,
     cu_seqlens_host: list[int] | None = None,
     return_h: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Varlen prefill, signature-compatible with ``gdn_prefill_chunk_fla``.
 
-    ``return_h`` also returns the per-chunk state the hybrid-radix track checkpoint reads
+    ``return_h`` also returns the state the hybrid-radix track checkpoint reads
     (``Qwen3_5GatedDeltaNet._write_track_snapshot``): ``[1, rows, Hv, Dk, Dv]`` in the pool's
     own slot layout, one row per CHUNK_SIZE slice of every request in ``prepare_chunk_offsets``
     order, row ``boh[i]+c`` holding the state BEFORE chunk ``c`` -- what fla's chunk_delta_h
-    stores at that row.
+    stores at that row. Only the row of each request's last chunk is written: it is the one
+    ``_build_track_metadata`` asks for.
     """
-    run = gdn_recurrent_metal if use_kernel else gdn_recurrent_torch
     # FLAMetadata's host copy when the caller has it: one flush per forward, not per layer.
     bounds = cu_seqlens.tolist() if cu_seqlens_host is None else cu_seqlens_host
     lens = [int(bounds[i + 1]) - int(bounds[i]) for i in range(len(bounds) - 1)]
@@ -347,25 +287,22 @@ def gdn_prefill_metal(
             continue
         lo = int(bounds[i])
         slot = indices[i : i + 1]
-        if h is None:
-            spans = ((lo, lo + n),)
-        else:
-            # The kernel keeps the state in registers across its whole T and writes it back
-            # once, so slicing at CHUNK_SIZE only adds the boundary round trips h needs.
-            spans = tuple((c, min(c + CHUNK_SIZE, lo + n)) for c in range(lo, lo + n, CHUNK_SIZE))
-            src = slot.long()
-        for a, b in spans:
-            if h is not None:
+        # The kernel keeps the state in registers across its whole T, so the run splits only
+        # where h needs a state: before the last chunk, one launch pair per request.
+        last = (n - 1) // CHUNK_SIZE if h is not None else 0
+        cut = lo + last * CHUNK_SIZE
+        for a, b in ((lo, cut), (cut, lo + n)) if last else ((lo, lo + n),):
+            if a == cut and last:
                 # copy_ into the row, not index_select(out=): under MPS the latter ignores the
                 # out view's storage offset and writes row 0 (torch 2.10).
-                h[0, row : row + 1].copy_(state_source.index_select(0, src))
-                row += 1
+                h[0, row + last : row + last + 1].copy_(state_source.index_select(0, slot.long()))
             outs.append(
-                run(
+                gdn_recurrent_metal(
                     q[:, a:b], k[:, a:b], v[:, a:b], g[:, a:b], beta[:, a:b],
                     state_source=state_source, indices=slot, scale=scale,
                 )[0]
             )
+        row += -(-n // CHUNK_SIZE)
     out = torch.cat(outs, dim=0)  # [total, Hv, Dv]
     return (out, h) if return_h else out
 
@@ -606,5 +543,5 @@ def gdn_decode_fused_metal(
 
 __all__ = [
     "fused_decode_supports", "gate_params", "gdn_decode_fused_metal", "gdn_decode_metal",
-    "gdn_prefill_metal", "gdn_recurrent_metal", "gdn_recurrent_torch", "is_available", "l2norm",
+    "gdn_prefill_metal", "gdn_recurrent_metal", "is_available",
 ]

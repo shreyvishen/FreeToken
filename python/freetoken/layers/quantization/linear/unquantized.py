@@ -50,7 +50,8 @@ class MetalLinearKernel(LinearKernel):
         from freetoken.kernel.metal import mlp
 
         w = layer.weight
-        if layer.bias is not None or x.dim() != 2 or not mlp.can_run(x, w):
+        if (layer.bias is not None or x.dim() != 2 or x.shape[0] > mlp.MAX_GEMV_ROWS
+                or not mlp.can_run(x, w)):
             return None
         if swiglu:
             return mlp.swiglu_gemv(x, w)

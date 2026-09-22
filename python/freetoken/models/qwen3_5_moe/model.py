@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import torch
 from freetoken.kernel import backend as device_backend
 from freetoken.core import get_global_ctx
-from freetoken.kernel.backend import is_mps
 from freetoken.layers import (
     BaseOP,
     GemmaRMSNorm,
@@ -25,15 +23,6 @@ from .moe import Qwen3_5DenseMLP, Qwen3_5MoE
 
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
-
-
-# Predict the next layer's routing one mixer early, only while the disk tier's counters say
-# the step is stalled on demand reads (DiskMoeCache.prefetch_pays).
-_MOE_PREFETCH = True
-
-
-# The gate a tier that does not measure itself gets: never speculate.
-_PF_NEVER = SimpleNamespace(prefetch_pays=False)
 
 
 class Qwen3_5DecoderLayer(BaseOP):
@@ -70,16 +59,27 @@ class Qwen3_5DecoderLayer(BaseOP):
         )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # Only the offload MoE layer can read ahead; False elsewhere keeps every other backend
-        # byte-for-byte unchanged.
-        self._moe_prefetch = _MOE_PREFETCH and hasattr(
-            getattr(self.mlp, "experts", None), "predict_from_router"
-        )
-        # Resolved lazily: the disk tier attaches to the MoE layer after __init__ runs.
-        self._pf_gate = None
+        # Only the offload MoE layer can read ahead, and `_prefetch` acts only where the cache
+        # measures that it pays (the SSD tier); every other backend runs as before.
+        self._moe_prefetch = hasattr(getattr(self.mlp, "experts", None), "predict_from_router")
         # Bound callables, not modules, so iter_offload_moe_layers doesn't yield them twice.
         self._next_router = None
         self._next_predict = None
+
+    @device_backend.host_step
+    def _prefetch(self, hidden: torch.Tensor, residual: torch.Tensor, norm) -> None:
+        """Issue the reads the previous layer predicted, then predict the next layer's routing,
+        while the disk tier's counters say the step is stalled on demand reads. A host step:
+        the decode tape replays the decision, not the launches of the step it was recorded on."""
+        # The disk tier attaches after __init__, and only it measures whether prefetch pays.
+        if not getattr(self.mlp.experts.offload_cache, "prefetch_pays", False):
+            return
+        # On the fused-norm path `residual` is the mixer's out-of-place output and is still
+        # empty here; the residual the router should see is norm[0] + hidden.
+        res_pre = residual if norm is None else norm[0] + hidden
+        self.mlp.experts.issue_from_prediction()
+        if self._next_predict is not None:
+            self._next_predict(self._next_router(res_pre))
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, residual: torch.Tensor | None):
@@ -97,19 +97,8 @@ class Qwen3_5DecoderLayer(BaseOP):
             residual = new_residual
         else:
             hidden, residual = self.input_layernorm.forward_add_residual(hidden, residual)
-        do_prefetch = self._moe_prefetch and hidden.shape[0] == 1
-        if do_prefetch and self._pf_gate is None:
-            gate = getattr(getattr(self.mlp, "experts", None), "offload_cache", None)
-            self._pf_gate = gate if hasattr(gate, "prefetch_pays") else _PF_NEVER
-        if do_prefetch and self._pf_gate.prefetch_pays:
-            # On the fused-norm path `residual` is the mixer's out-of-place output and is
-            # still empty here; the residual the router should see is norm[0] + hidden.
-            res_pre = residual if norm is None else norm[0] + hidden
-            # Reads the previous layer predicted (its async D2H already landed); then
-            # predict for the next layer, again asynchronously. Decode only.
-            self.mlp.experts.issue_from_prediction()
-            if self._next_predict is not None:
-                self._next_predict(self._next_router(res_pre))
+        if self._moe_prefetch and hidden.shape[0] == 1:
+            self._prefetch(hidden, residual, norm)
         hidden = mixer.forward(hidden, norm=norm)
         # Submit the mixer's launches now: the GPU runs them while the host encodes the
         # norm and the router, and the disk tier's routing readback then waits on less.
@@ -145,17 +134,16 @@ class Qwen3_5Model(BaseOP):
             ]
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        if _MOE_PREFETCH:
-            # Layer L predicts layer L+1's routing, so it needs L+1's router and norm.
-            layers = self.layers.op_list
-            for layer, nxt in zip(layers, layers[1:]):
-                experts = getattr(nxt.mlp, "experts", None)
-                if layer._moe_prefetch and hasattr(experts, "predict_from_router"):
-                    layer._next_predict = experts.predict_from_router
-                    layer._next_router = (
-                        lambda x, g=nxt.mlp.gate, n=nxt.post_attention_layernorm:
-                        g.forward(n.forward(x))
-                    )
+        # Layer L predicts layer L+1's routing, so it needs L+1's router and norm.
+        layers = self.layers.op_list
+        for layer, nxt in zip(layers, layers[1:]):
+            experts = getattr(nxt.mlp, "experts", None)
+            if layer._moe_prefetch and hasattr(experts, "predict_from_router"):
+                layer._next_predict = experts.predict_from_router
+                layer._next_router = (
+                    lambda x, g=nxt.mlp.gate, n=nxt.post_attention_layernorm:
+                    g.forward(n.forward(x))
+                )
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = embed_input_ids(self.embed_tokens, input_ids, get_global_ctx().batch)

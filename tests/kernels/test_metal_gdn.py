@@ -13,7 +13,7 @@ from freetoken.kernel.fla.const import CHUNK_SIZE
 from freetoken.kernel.metal import is_available
 from freetoken.kernel.metal.gdn import (
     fused_decode_supports, gate_params_metal, gdn_decode_fused_metal, gdn_decode_metal,
-    gdn_prefill_metal, gdn_recurrent_metal, gdn_recurrent_torch,
+    gdn_prefill_metal, gdn_recurrent_metal,
 )
 from freetoken.kernel.metal.ops import rms_norm_gated
 
@@ -161,9 +161,10 @@ def test_prefill_matches_decode():
 
 
 def test_prefill_per_chunk_state():
-    """``return_h`` feeds the hybrid-radix track checkpoint: row ``boh[i] + c`` is request i's
-    state after c whole CHUNK_SIZE slices, which is what ``_write_track_snapshot`` copies into
-    the pool. Turning it on must not move the output or the state the pool keeps."""
+    """``return_h`` feeds the hybrid-radix track checkpoint: row ``boh[i] + c`` for a request's
+    last chunk c is its state after c whole CHUNK_SIZE slices, which is what
+    ``_write_track_snapshot`` copies into the pool. Turning it on must not move the output or
+    the state the pool keeps."""
     hk, hv = 2, 4
     lens = [70, 64, 200, 1]        # ragged: past a chunk, exactly a chunk, deep, single token
     cu = list(itertools.accumulate(lens, initial=0))
@@ -188,13 +189,13 @@ def test_prefill_per_chunk_state():
     assert h.shape == (1, boh[-1], hv, DK, DV)
     for i, n in enumerate(lens):
         # the deepest row is the only one _build_track_metadata ever asks for
-        assert (n - 1) // CHUNK_SIZE == nchunks[i] - 1
-        for c in range(nchunks[i]):
-            ref = start.clone()
-            lo, hi = cu[i], cu[i] + c * CHUNK_SIZE
-            if c:
-                gdn_recurrent_torch(q[:, lo:hi], k[:, lo:hi], v[:, lo:hi], g[:, lo:hi],
-                                    beta[:, lo:hi], state_source=ref, indices=slots[i:i + 1],
-                                    scale=DK**-0.5)
-            err = (h[0, boh[i] + c] - ref[int(slots[i])]).abs().max().item()
-            assert err < 1e-5, f"request {i} chunk {c}: {err}"
+        c = (n - 1) // CHUNK_SIZE
+        if not c:
+            continue
+        lo, hi = cu[i], cu[i] + c * CHUNK_SIZE
+        up = lambda x: x[:, lo:hi].float().cpu().repeat_interleave(hv // hk, dim=2)  # noqa: E731
+        _, ref = _oracle().recurrent_gated_delta_rule(
+            up(q), up(k), v[:, lo:hi].float().cpu(), g[:, lo:hi].cpu(), beta[:, lo:hi].cpu(),
+            initial_state=start[int(slots[i])][None].cpu())
+        err = (h[0, boh[i] + c].cpu() - ref[0]).abs().max().item()
+        assert err < 1e-5, f"request {i} chunk {c}: {err}"

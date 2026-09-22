@@ -12,6 +12,7 @@ import pytest
 import safetensors.torch
 import torch
 
+from freetoken.kernel.metal import is_available
 from freetoken.moe.disk_cache import PIN_FRAC, PIN_RANK_TOKENS, DiskMoeCache
 from freetoken.moe.expert_reader import _F_RDADVISE, PIECE_ORDER, ExpertReader, Nvfp4DiskIndex
 
@@ -166,3 +167,27 @@ def test_the_pin_set_never_outgrows_the_slot_cache(tmp_path):
         assert pinned == layers * min(int(PIN_FRAC * experts), cache_size // (2 * layers))
         assert pinned * 2 <= cache_size, cache_size
         cache.close()
+
+
+@pytest.mark.skipif(not is_available(), reason="the slot scatter is a Metal kernel")
+def test_the_metal_slot_scatter_writes_what_the_row_copies_write(tmp_path):
+    """Slots differ from staged rows (expert 0 warms slot 0 first), and the prefetch path's
+    ``rows=`` form moves staged rows 2 and 0 into slots 3 and 0."""
+    model_path, _ = write_tiny_checkpoint(tmp_path, num_experts=4)
+    banks = []
+    for device in (torch.device("cpu"), torch.device("mps")):
+        cache = DiskMoeCache(num_layers=1, num_experts=4, cache_size=4, device=device,
+                             quant_format="nvfp4")
+        cache.set_disk_source(ExpertReader(model_path), HIDDEN, INTER)
+        assert cache._scatter == (device.type == "mps")
+        for experts in ([[0]], [[3, 1, 2]]):
+            cache.ensure_experts(LAYER, torch.tensor(experts, dtype=torch.int32, device=device))
+            cache.copy_missing()
+        assert cache._slot_of[LAYER].tolist() == [0, 1, 2, 3]   # experts 1-3 from staged rows 0-2
+        torch.mps.synchronize()   # the engine's next routing read drains the queue before a reuse
+        cache._flush_rows([3, 0], 3, rows=[2, 0])
+        torch.mps.synchronize()
+        banks.append({n: b.cpu().view(torch.uint8) for n, b in cache.bank_caches.items()})
+        cache.close()
+    for name, bank in banks[0].items():
+        assert torch.equal(bank, banks[1][name]), name

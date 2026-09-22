@@ -1,7 +1,7 @@
 """The elementwise epilogues that sit between the GEMMs, one launch each: ``silu_and_mul``,
 SwiGLU over uninterleaved halves, and ``sigmoid_gate_mul``, ``x * sigmoid(gate) (+ add)``
 with ``gate`` either as wide as ``x`` (the attention output gate) or one column that
-broadcasts (the MoE epilogue)."""
+broadcasts (the MoE epilogue). Plus ``scatter_rows``, the SSD tier's staging-to-slot copy."""
 
 from __future__ import annotations
 
@@ -48,6 +48,37 @@ kernel void sigmoid_gate_mul(
   out[i] = T(y);
 }
 """
+
+_SCATTER_SOURCE = r"""
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void scatter_rows(
+    device uint4* dst             [[buffer(0)]],   // [S, row_words] bank
+    device const uint4* src       [[buffer(1)]],   // staged records
+    device const int* idx         [[buffer(2)]],   // [2, n]: destination slot, staged row
+    constant uint& n              [[buffer(3)]],
+    constant uint& row_words      [[buffer(4)]],
+    constant uint& record_words   [[buffer(5)]],
+    constant uint& offset_words   [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  if (gid.x >= row_words) { return; }
+  dst[uint(idx[gid.y]) * row_words + gid.x] =
+      src[uint(idx[n + gid.y]) * record_words + offset_words + gid.x];
+}
+"""
+
+
+def scatter_rows(bank: torch.Tensor, records: torch.Tensor, idx: torch.Tensor, n: int,
+                 record_bytes: int, offset: int) -> None:
+    """``bank[idx[0, i]] = records[idx[1, i], offset : offset + row bytes]`` for ``i < n``, one
+    launch; every size and offset a multiple of 16 bytes."""
+    words = bank[0].numel() * bank.element_size() // 16
+    compile(_SCATTER_SOURCE).scatter_rows(
+        bank, records, idx, n, words, record_bytes // 16, offset // 16,
+        threads=(words, n, 1), group_size=(min(words, 256), 1, 1),
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -104,6 +135,6 @@ def sigmoid_gate_mul_metal(
 
 
 __all__ = [
-    "sigmoid_gate_mul_metal", "silu_and_mul_metal", "supports_sigmoid_gate_mul",
+    "scatter_rows", "sigmoid_gate_mul_metal", "silu_and_mul_metal", "supports_sigmoid_gate_mul",
     "supports_silu_and_mul",
 ]

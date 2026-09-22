@@ -15,7 +15,7 @@ MSL_INT = {torch.int32: "int", torch.int64: "long", torch.uint32: "uint"}
 
 MAX_TG_FLOATS = 32768 // 4   # the threadgroup memory limit, in float32 slots
 
-# The e4m3 bits placed in the fp16 field are exact, subnormals included: bitcast, rescale.
+# The e4m3 bits placed in the fp16 field are exact for every finite value, subnormals included.
 E4M3_U8_TO_F32 = r"""
 inline float e4m3_u8_to_f32(uchar v) {
     ushort h = (ushort(v & 0x80) << 8) | (ushort(v & 0x7F) << 7);
@@ -58,9 +58,29 @@ def is_available() -> bool:
 # The library comes back behind a proxy so engine/mps_tape.py can record every launch.
 _recorder = None  # callable(fn, args, kwargs) while a tape records, else None
 
+
 def set_recorder(callback) -> None:
     global _recorder
     _recorder = callback
+
+
+def recording() -> bool:
+    return _recorder is not None
+
+
+def run_host_step(fn, args, kwargs):
+    """``fn(*args, **kwargs)``; while a tape records, it keeps the call itself and traces nothing
+    the call runs (``kernel/backend.py:host_step``)."""
+    global _recorder
+    rec = _recorder
+    if rec is None:
+        return fn(*args, **kwargs)
+    rec(fn, args, kwargs)
+    _recorder = None
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        _recorder = rec
 
 
 class TapedLibrary:

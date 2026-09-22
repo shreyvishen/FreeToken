@@ -137,3 +137,26 @@ def test_plan_replay_matches_eager():
     for i, (a, b, c) in enumerate(zip(eager, plan, again)):
         assert torch.isfinite(a).all() and torch.equal(a, c), f"eager is nondeterministic at {i}"
         assert torch.equal(a, b), f"plan differs from eager at step {i}: {(a - b).abs().max()}"
+
+
+@mps
+def test_the_tape_replays_a_host_step_on_fresh_data():
+    """A host step (the SSD tier's routing read) is kept whole on the tape: each replay runs it
+    again between the launches around it, on what those launches just wrote."""
+    from freetoken.engine.mps_tape import DecodeTape
+    from freetoken.kernel.backend import host_step
+
+    seen = []
+
+    class Tier:
+        @host_step
+        def read(self, t):
+            seen.append(t.item())
+            t.add_(10)   # untraced: the replay reruns the step, not this launch
+
+    tier, x, out = Tier(), torch.zeros(1, device="mps"), torch.zeros(1, device="mps")
+    tape = DecodeTape.record(lambda: (x.add_(1), tier.read(x), out.copy_(x * 2)))
+    with torch.inference_mode():   # the engine replays inside it, as the tape recorded
+        for _ in range(2):
+            tape.replay()
+    assert seen == [1.0, 12.0, 23.0] and out.item() == 66.0

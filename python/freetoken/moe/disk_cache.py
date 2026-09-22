@@ -14,7 +14,7 @@ from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
 
-MAX_THREADS = 8  # pread saturates the drive before more threads stop helping
+MAX_THREADS = 8  # preads in flight at most
 DEFAULT_STAGE_ROWS = 32  # staging rows; prefill loops in chunks, decode needs top_k
 _NEVER = np.iinfo(np.int64).max
 
@@ -49,6 +49,7 @@ class DiskMoeCache(OffloadMoeCache):
         )
         self.reader = reader
         self._pool = ThreadPoolExecutor(max_workers=MAX_THREADS, thread_name_prefix="ft-moe-disk")
+        self._hinter = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ft-moe-hint")
         h, i = hidden_size, intermediate_size
         specs = nvfp4_bank_specs(self.num_experts, h, i)
 
@@ -70,8 +71,12 @@ class DiskMoeCache(OffloadMoeCache):
             self._layout.append((name, offset, row_bytes, tuple(shape[1:]), dtype))
             offset += row_bytes
         self.bytes_per_expert = offset
+        # The Metal scatter moves 16-byte words, so every bank row and record must be whole words.
+        self._scatter = self.device.type == "mps" and all(
+            off % 16 == 0 and rb % 16 == 0 for _n, off, rb, _s, _d in self._layout
+        ) and offset % 16 == 0
         (self._host_arena, self._dev_arena, self._arena_np, self._row_view, self._glob,
-         self._dests) = self._make_arena(self.stage_rows)
+         self._dests, self._idx) = self._make_arena(self.stage_rows)
         # Two prefetch arenas, alternating so neither is rewritten before the routing D2H two
         # layers later drains the copy that read it. Allocated on first use.
         self._pf_banks: list[tuple] = []
@@ -116,11 +121,9 @@ class DiskMoeCache(OffloadMoeCache):
         # Half the cache at most: PIN_FRAC of a 512-expert layer over 48 layers can name more
         # slots than the tier holds, and an all-pinned cache re-ranks unbiased on every miss.
         k = min(k, max(1, self.cache_size // (2 * self.num_layers)))
-        # argpartition, not argsort: the order inside the head does not matter.
         head = np.argpartition(-self._route_counts, k - 1, axis=1)[:, :k]
         self._pin_expert = np.zeros((self.num_layers, self.num_experts), dtype=bool)
         np.put_along_axis(self._pin_expert, head, True, axis=1)
-        # Pin slots already holding a head expert now; their next fill would evict it once.
         live = np.flatnonzero(self._id_of_slot >= 0)
         pinned[:] = False
         if live.size:
@@ -132,9 +135,9 @@ class DiskMoeCache(OffloadMoeCache):
         )
 
     def _make_arena(self, rows: int) -> tuple:
-        """A staging arena of ``rows`` expert records: host buffer (``None`` on Metal, where it
-        is pinned and read in place), the tensor the row copies read, its numpy alias, the
-        per-row views, the globals zone, the nine ``preadv`` destinations."""
+        """A staging arena of ``rows`` expert records: host buffer (``None`` on Metal, where it is
+        read in place), device tensor, numpy alias, the fp16 global banks, the f32 globals, the
+        ``preadv`` destinations and, on Metal, the scatter's indices."""
         nbytes = rows * self.bytes_per_expert
         if self.device.type == "mps":
             # pinned-on-the-shared-heap, so a pread lands where the GPU reads it (kernel/backend.py)
@@ -144,13 +147,13 @@ class DiskMoeCache(OffloadMoeCache):
             host = torch.empty(nbytes, dtype=torch.uint8)
             dev = torch.empty(nbytes, dtype=torch.uint8, device=self.device)
             arena_np = host.numpy()
-        # For the two writes preadv cannot do itself; both views outlive ``dev``.
-        row_view = {
-            name: [torch.frombuffer(arena_np, dtype=torch.uint8, count=rb,
-                                    offset=r * self.bytes_per_expert + off,
-                                    ).view(dtype).reshape(shape) for r in range(rows)]
-            for name, off, rb, shape, dtype in self._layout
-        }
+        # For the two writes preadv cannot do itself: every record's fp16 global bank as one
+        # strided array over the arena, so a batch of rows is three numpy writes.
+        row_view = tuple(
+            np.ndarray((rows, *shape), np.float16, arena_np, off, (self.bytes_per_expert, 2))
+            for name, off, _rb, shape, _dtype in self._layout
+            if name in ("gate_up_global", "down_global")
+        )
         glob = np.empty((rows, 3), dtype=np.float32)
         span = {name: (off, rb) for name, off, rb, _shape, _dtype in self._layout}
 
@@ -159,9 +162,8 @@ class DiskMoeCache(OffloadMoeCache):
             base = row * self.bytes_per_expert + off
             return memoryview(arena_np[base + int(size * lo) : base + int(size * hi)])
 
-        # The nine byte views one expert's preadv scatters into: six are ranges of this row's
-        # record, so a read lands the bytes where the device copy picks them up; the globals,
-        # f32 on disk but per-row fp16 in the bank, go to ``glob``.
+        # One expert's nine preadv destinations: six ranges of this row's record, and the three
+        # f32 globals into ``glob`` (the bank keeps them per row, fp16).
         dests = [
             [mv(r, "gate_up_packed", 0, 0.5), mv(r, "gate_up_scale", 0, 0.5),
              memoryview(glob[r, 0:1]).cast("B"),
@@ -170,7 +172,12 @@ class DiskMoeCache(OffloadMoeCache):
              mv(r, "down_packed"), mv(r, "down_scale"), memoryview(glob[r, 2:3]).cast("B")]
             for r in range(rows)
         ]
-        return host, dev, arena_np, row_view, glob, dests
+        # Written by numpy, read by the scatter in place: an H2D of them would wait on the GPU.
+        idx = None
+        if self._scatter:
+            idx_dev, idx_np = backend.shared_host_arena(2 * rows * 4)
+            idx = (idx_dev.view(torch.int32), idx_np.view(np.int32))
+        return host, dev, arena_np, row_view, glob, dests, idx
 
     def _read_rows(self, layer_id: int, experts: list[int]) -> None:
         """Fill staging rows ``0..len(experts)`` from disk, ``MAX_THREADS`` reads in flight."""
@@ -181,40 +188,54 @@ class DiskMoeCache(OffloadMoeCache):
             list(self._pool.map(lambda j: self.reader.read_into(layer_id, j[0], j[1]), jobs))
         self._apply_globals(self._row_view, self._glob, range(len(experts)))
 
-    def _apply_globals(self, row_view: dict, glob: np.ndarray, rows) -> None:
+    def _apply_globals(self, row_view: tuple, glob: np.ndarray, rows) -> None:
         """Broadcast the f32 scales a read landed in ``glob`` into ``row_view``'s rows."""
         rows = list(rows)
         if not rows:
             return
         i = self.intermediate_size
-        g = torch.from_numpy(glob[rows]).to(torch.float16)
-        for j, r in enumerate(rows):
-            row_view["gate_up_global"][r][:i] = g[j, 0]
-            row_view["gate_up_global"][r][i:] = g[j, 1]
-            row_view["down_global"][r].fill_(g[j, 2])
+        gate_up, down = row_view
+        g = glob[rows].astype(np.float16)
+        gate_up[rows, :i] = g[:, 0:1]
+        gate_up[rows, i:] = g[:, 1:2]
+        down[rows] = g[:, 2:3]
 
-    # ``non_blocking=True`` overrides ``backend.NON_BLOCKING`` safely here: that rule guards an
-    # async H2D whose source is freed before the blit runs, and these read a buffer this object
-    # owns for its lifetime, rewritten only after the next layer's routing D2H drains the queue.
+    # ``non_blocking=True`` is safe despite ``backend.NON_BLOCKING``: the arena is rewritten only
+    # after the next layer's routing D2H drains the queue.
     def _flush_rows(
         self, slots: list[int], n: int, *, non_blocking: bool = False, arena: tuple | None = None,
         rows: list[int] | None = None,
     ) -> None:
-        """Write staging rows ``0..n`` into ``slots``, one plain row copy per (bank, row) --
-        not ``index_put_``, which on MPS costs several times the rows it moves."""
-        host, dev = ((self._host_arena, self._dev_arena) if arena is None else (arena[0], arena[1]))
+        """Write staging rows ``0..n`` (or ``rows``) into ``slots``: on Metal one scatter launch
+        per bank, else one plain row copy per (bank, row) -- not ``index_put_``, which on MPS
+        costs several times the rows it moves."""
+        host, dev, idx = ((self._host_arena, self._dev_arena, self._idx) if arena is None
+                          else (arena[0], arena[1], arena[6]))
         nbytes = n * self.bytes_per_expert
         if host is not None:
             dev[:nbytes].copy_(host[:nbytes], non_blocking=non_blocking or backend.NON_BLOCKING)
-        records = dev[:nbytes].view(n, self.bytes_per_expert)
-        for name, off, row_bytes, shape, dtype in self._layout:
-            bank = self.bank_caches[name]
-            for i, r in enumerate(range(n) if rows is None else rows):
-                bank[slots[i]].copy_(records[r, off : off + row_bytes].view(dtype).reshape(shape))
+        staged = list(range(n)) if rows is None else rows
+        if self._scatter:
+            from freetoken.kernel.metal.elementwise import scatter_rows
+
+            k = len(slots)
+            idx[1][:k] = slots
+            idx[1][k : 2 * k] = staged
+            for name, off, _row_bytes, _shape, _dtype in self._layout:
+                scatter_rows(self.bank_caches[name], dev, idx[0], k, self.bytes_per_expert,
+                             off)
+        else:
+            records = dev[:nbytes].view(n, self.bytes_per_expert)
+            for name, off, row_bytes, shape, dtype in self._layout:
+                bank = self.bank_caches[name]
+                for i, r in enumerate(staged):
+                    row = records[r, off : off + row_bytes].view(dtype).reshape(shape)
+                    bank[slots[i]].copy_(row)
         if host is None and not non_blocking:
-            # The row copies read the pinned arena lazily; the caller made no promise.
+            # The copies read the pinned arena lazily; the caller made no promise.
             backend.synchronize()
 
+    @backend.host_step
     def ensure_experts(
         self, layer_id: int, expert_ids: torch.Tensor, *, prefill: bool = False,
     ) -> None:
@@ -243,7 +264,6 @@ class DiskMoeCache(OffloadMoeCache):
                     self._rank_pins()
                     self._pin_next *= 2
         if not prefill and layer_id == self.num_layers - 1:
-            # A token has finished: re-decide whether prefetch pays, over a doubling window.
             self._auto_tokens += 1
             if self._auto_tokens >= self._auto_next:
                 tokens0, misses0 = self._auto_at
@@ -286,8 +306,13 @@ class DiskMoeCache(OffloadMoeCache):
             rank[j] = _NEVER
             slots[expert] = victim
             pending.append((int(expert), victim))
-            # Start the drive now, while the host still has this step's routing to finish.
-            self.reader.hint(layer_id, int(expert))
+            if not prefill:
+                # Start the drive now: a decode step waits on the predicted reads first.
+                self.reader.hint(layer_id, int(expert))
+        if prefill and pending:
+            # Off this thread: a hint that must queue I/O blocks, and the read pool starts now.
+            experts = [e for e, _ in pending]
+            self._hinter.submit(lambda: [self.reader.hint(layer_id, e) for e in experts])
         self.n_misses += len(pending)
 
         self._pending = pending
@@ -359,6 +384,7 @@ class DiskMoeCache(OffloadMoeCache):
         something commits the buffer, and the only commit here is the next layer's routing D2H."""
         backend.flush()
 
+    @backend.host_step
     def copy_missing(self) -> None:
         pending, self._pending = self._pending, []
         if not pending:
@@ -417,6 +443,14 @@ class DiskMoeCache(OffloadMoeCache):
         self._usage[: self.num_experts] = self._step
         self._pinned[: self.num_experts] = False  # whatever decode had pinned there is gone
 
+    def validate_rebuild(self, cache_size: int) -> None:
+        super().validate_rebuild(cache_size)
+        if getattr(self, "bank_caches", None):
+            # The numpy LRU and the arenas are sized once; the engine rejects before teardown.
+            raise ValueError(
+                f"the SSD tier cannot resize in place; restart with --moe-cache-size {cache_size}"
+            )
+
     def reset(self) -> None:
         self._slot_of.fill(-1)
         self._id_of_slot.fill(-1)
@@ -425,8 +459,16 @@ class DiskMoeCache(OffloadMoeCache):
         self._pending = []
         self._drop_prefetch()
         self._pinned.fill(False)
+        # The routing counters too: a decode-plan capture runs dummy tokens through the tier.
+        self._pin_expert = None
+        self._route_counts.fill(0)
+        self._pin_tokens, self._pin_next = 0, PIN_RANK_TOKENS
+        self._auto_tokens, self._auto_next, self._auto_at = 0, PIN_RANK_TOKENS, (0, 0)
+        self.prefetch_pays = False
+        self.n_misses = 0
 
     def close(self) -> None:
         self._drop_prefetch()
         self._pool.shutdown(wait=True)
+        self._hinter.shutdown(wait=True)
         self.reader.close()
